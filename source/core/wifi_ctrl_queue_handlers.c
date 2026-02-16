@@ -109,6 +109,11 @@ void process_channel_change_event(wifi_channel_change_event_t *ch_chg, bool is_n
 
 void process_scan_results_event(scan_results_t *results, unsigned int len)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! len:%u, num:%u, radio:%u\n", __func__, __LINE__, len, results->num, results->radio_index);
+    for (unsigned int i = 0; i < results->num; ++i) {
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! SSID:%s, RSSI:%d\n", __func__, __LINE__, results->bss[i].ssid, results->bss[i].rssi);
+    }
     wifi_ctrl_t *ctrl;
     vap_svc_t *ext_svc;
     wifi_mgr_t *mgr = (wifi_mgr_t *)get_wifimgr_obj();
@@ -119,6 +124,7 @@ void process_scan_results_event(scan_results_t *results, unsigned int len)
     if (is_sta_enabled()) {
         ext_svc->event_fn(ext_svc, wifi_event_type_hal_ind, wifi_event_scan_results, vap_svc_event_none, results);
     }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 void process_csa_beacon_frame_event(frame_data_t *msg, uint32_t msg_length, wifi_ctrl_t *ctrl)
@@ -3966,8 +3972,10 @@ void handle_command_event(wifi_ctrl_t *ctrl, void *data, unsigned int len,
 void handle_hal_indication(wifi_ctrl_t *ctrl, void *data, unsigned int len,
     wifi_event_subtype_t subtype)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     bool nop_start_reboot = 0;
     unsigned int dfs_timer_secs = 0;
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! subtype:%s\n", __func__, __LINE__, wifi_event_subtype_to_string(subtype));
     switch (subtype) {
     case wifi_event_hal_unknown_frame:
         process_unknown_frame_event(data, len);
@@ -4050,6 +4058,7 @@ void handle_hal_indication(wifi_ctrl_t *ctrl, void *data, unsigned int len,
 #if ONEWIFI_ANALYTICS_APP_SUPPORT
     apps_mgr_analytics_event(&ctrl->apps_mgr, wifi_event_type_hal_ind, subtype, data);
 #endif
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 void update_subdoc_data(webconfig_subdoc_data_t *data, unsigned int num_ssid,

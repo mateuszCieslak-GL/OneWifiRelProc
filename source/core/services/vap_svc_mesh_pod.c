@@ -75,6 +75,7 @@ int vap_svc_mesh_ext_disconnect(vap_svc_t *svc)
 
 int vap_svc_mesh_ext_start(vap_svc_t *svc, unsigned int radio_index, wifi_vap_info_map_t *map)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     uint8_t num_of_radios;
     uint8_t j;
     int i;
@@ -86,11 +87,13 @@ int vap_svc_mesh_ext_start(vap_svc_t *svc, unsigned int radio_index, wifi_vap_in
 
     if ((num_of_radios = getNumberRadios()) > MAX_NUM_RADIOS) {
         wifi_util_dbg_print(WIFI_CTRL,"WIFI %s : Number of Radios %d exceeds supported %d Radios \n",__FUNCTION__, getNumberRadios(), MAX_NUM_RADIOS);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return RETURN_ERR;
     }
 
     vap_svc_ext_t *ext;
     ext = &svc->u.ext;
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_in_progress\n", __func__, __LINE__);
     ext->conn_state = connection_state_connection_in_progress;
     for (i = num_of_radios-1; i >= 0; i--) {
         if (radio_index != WIFI_ALL_RADIO_INDICES && i != radio_index) {
@@ -100,6 +103,7 @@ int vap_svc_mesh_ext_start(vap_svc_t *svc, unsigned int radio_index, wifi_vap_in
         vap_map = (wifi_vap_info_map_t *)get_wifidb_vap_map(i);
         if (vap_map == NULL) {
             wifi_util_dbg_print(WIFI_CTRL,"%s:failed to get vap map for radio index: %d\n",__FUNCTION__, i);
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
             return RETURN_ERR;
         }
 
@@ -130,11 +134,13 @@ int vap_svc_mesh_ext_start(vap_svc_t *svc, unsigned int radio_index, wifi_vap_in
             ret = convert_radio_index_to_ifname(svc->prop,tgt_vap_map.vap_array[tgt_vap_map.num_vaps].radio_index,vif_config.phy_name,sizeof(vif_config.phy_name));
             if (ret != RETURN_OK) {
                 wifi_util_dbg_print(WIFI_CTRL,"%s:Failed to get phy name.",__FUNCTION__);
+                wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
                 return RETURN_ERR;
             }
             ret = convert_apindex_to_ifname(svc->prop,tgt_vap_map.vap_array[tgt_vap_map.num_vaps].vap_index,vif_config.vif_name ,sizeof(vif_config.vif_name));
             if (ret != RETURN_OK) {
                 wifi_util_dbg_print(WIFI_CTRL,"%s:Failed to get interface name.",__FUNCTION__);
+                wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
                 return RETURN_ERR;
             }
             // If interface is already enbaled restart network
@@ -153,8 +159,9 @@ int vap_svc_mesh_ext_start(vap_svc_t *svc, unsigned int radio_index, wifi_vap_in
             vap_map->vap_array[j].u.sta_info.enabled = true;
             tgt_vap_map.num_vaps++;
         }
-   }
-   return RETURN_OK;
+    }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
+    return RETURN_OK;
 }
 
 int vap_svc_mesh_ext_stop(vap_svc_t *svc, unsigned int radio_index, wifi_vap_info_map_t *map)
@@ -414,6 +421,7 @@ int publish_ext_sta_connection_status(wifi_ctrl_t *ctrl,int index, wifi_connecti
 
 int process_ext_sta_conn_status(vap_svc_t *svc, void *arg)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     wifi_mgr_t *mgr = (wifi_mgr_t *)get_wifimgr_obj();
     wifi_vap_info_map_t *vap_map;
     wifi_vap_info_t *temp_vap_info = NULL;
@@ -446,6 +454,7 @@ int process_ext_sta_conn_status(vap_svc_t *svc, void *arg)
                 is_bssid_valid(sta_data->bss_info.bssid) &&
                 memcmp(temp_vap_info->u.sta_info.bssid, sta_data->bss_info.bssid, sizeof(bssid_t)) == 0) {
                 wifi_util_info_print(WIFI_CTRL, "%s:%d: received duplicated wifi_event_hal_sta_conn_status event.\n", __func__, __LINE__);
+                wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
                 return 0;
             }
             temp_vap_info->u.sta_info.conn_status = sta_data->stats.connect_status;
@@ -455,6 +464,7 @@ int process_ext_sta_conn_status(vap_svc_t *svc, void *arg)
 
     if (temp_vap_info == NULL) {
         wifi_util_error_print(WIFI_CTRL, "%s:%d: temp_vap_info is NULL \n", __func__, __LINE__);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return RETURN_ERR;
     }
 
@@ -515,6 +525,7 @@ int process_ext_sta_conn_status(vap_svc_t *svc, void *arg)
             wifi_util_dbg_print(WIFI_CTRL,"%s:%d - STA disconnected vap index: %d.\n", __func__, __LINE__,sta_data->stats.vap_index);
 
             // Set conn_state to in progress immediately after disconnect
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_in_progress\n", __func__, __LINE__);
             ext->conn_state = connection_state_connection_in_progress;
             ext->connected_vap_index = 0;
 
@@ -541,9 +552,11 @@ int process_ext_sta_conn_status(vap_svc_t *svc, void *arg)
     if (send_event == true) {
         if (publish_ext_sta_connection_status(ctrl,index,sta_data->stats.connect_status) != RETURN_OK) {
              wifi_util_dbg_print(WIFI_CTRL, "%s:%d: rbusEvent_Publish Event failed\n", __func__, __LINE__);
+             wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
              return RETURN_ERR;
          }
     }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
     return RETURN_OK;
 }
 

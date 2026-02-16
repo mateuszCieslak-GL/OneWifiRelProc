@@ -425,9 +425,11 @@ void sort_bss_results_by_rssi(bss_candidate_t *bss, int start, int end)
 static void ext_set_conn_state(mesh_sta_node_data_t *ext, connection_state_t new_conn_state,
     const char *func, int line)
 {
-    wifi_util_info_print(WIFI_SERVICES, "%s:%d change connection state: %s -> %s\r\n", func, line,
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
+    wifi_util_info_print(WIFI_SERVICES, "%s:%d !!!!!! change connection state: %s -> %s\r\n", func, line,
         ext_conn_state_to_str(ext->conn_state), ext_conn_state_to_str(new_conn_state));
     ext->conn_state = new_conn_state;
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 static void ext_reset_radios(wifi_service_node_t *node)
@@ -603,6 +605,7 @@ static void ext_try_disconnecting(wifi_service_node_t *node)
 
 void cancel_scan_result_timer(wifi_service_node_t *node)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     mesh_sta_node_data_t *ext;
     wifi_ctrl_t *ctrl;
 
@@ -619,6 +622,7 @@ void cancel_scan_result_timer(wifi_service_node_t *node)
         scheduler_cancel_timer_task(ctrl->sched, ext->ext_connected_scan_result_timeout_handler_id);
         ext->ext_connected_scan_result_timeout_handler_id = 0;
     }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 static int process_ext_connect_event_timeout(wifi_service_node_t *node)
@@ -678,6 +682,7 @@ int process_disconnection_event_timeout(wifi_service_node_t *node)
 
 void ext_start_scan(wifi_service_node_t *node)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     wifi_channels_list_t *channels;
     unsigned int radio_index;
     mesh_sta_node_data_t *ext;
@@ -691,6 +696,7 @@ void ext_start_scan(wifi_service_node_t *node)
     if (ext->conn_state != connection_state_disconnected_scan_list_none) {
         wifi_util_dbg_print(WIFI_SERVICES,"%s:%d wifi_scan completed, current state: %s\r\n",__func__,
             __LINE__, ext_conn_state_to_str(ext->conn_state));
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return;
     }
 
@@ -714,13 +720,16 @@ void ext_start_scan(wifi_service_node_t *node)
             channels->channels_list);
     }
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! add timeout task for handling of wifi scan results\n", __func__, __LINE__);
     scheduler_add_timer_task(ctrl->sched, FALSE, &ext->ext_scan_result_timeout_handler_id,
                 process_scan_result_timeout, node,
                 EXT_SCAN_RESULT_TIMEOUT, 0, FALSE);
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 void ext_process_scan_list(wifi_service_node_t *node)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     mesh_sta_node_data_t *ext;
     wifi_ctrl_t *ctrl;
 
@@ -733,6 +742,7 @@ void ext_process_scan_list(wifi_service_node_t *node)
         ext->wait_scan_result = 0;
         // process scan list, arrange candidates according to policies
         if (ext->candidates_list.scan_count != 0) {
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_in_progress\n", __func__, __LINE__);
             ext_set_conn_state(ext, connection_state_connection_in_progress, __func__, __LINE__);
         } else {
             ext_set_conn_state(ext, connection_state_disconnected_scan_list_none, __func__,
@@ -745,6 +755,7 @@ void ext_process_scan_list(wifi_service_node_t *node)
     } else {
         wifi_util_dbg_print(WIFI_SERVICES,"%s:%d wifi connection already in process state\n",__func__, __LINE__);
     }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 void ext_incomplete_scan_list(wifi_service_node_t *node)
@@ -787,6 +798,7 @@ int process_scan_result_timeout(wifi_service_node_t *node)
 
 void ext_try_connecting(wifi_service_node_t *node)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     mesh_sta_node_data_t *ext;
     wifi_ctrl_t *ctrl;
     wifi_vap_info_t *vap_info;
@@ -843,6 +855,7 @@ void ext_try_connecting(wifi_service_node_t *node)
         // Set to disabled in order to detect state change on connection retry
         vap_info->u.sta_info.conn_status = wifi_connection_status_disabled;
         ext->conn_retry++;
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! wifi_hal_connect\n", __func__, __LINE__);
         if (wifi_hal_connect(vap_index, &candidate->external_ap) == RETURN_ERR) {
             wifi_util_error_print(WIFI_SERVICES, "%s:%d sta connect failed for vap index: %d, "
                 "retry after timeout\n", __func__, __LINE__, vap_index);
@@ -863,10 +876,12 @@ void ext_try_connecting(wifi_service_node_t *node)
                 process_ext_connect_algorithm, node,
                 EXT_CONNECT_ALGO_PROCESSOR_INTERVAL, 1, FALSE);
     }
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 }
 
 int process_ext_connect_algorithm(wifi_service_node_t *node)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     mesh_sta_node_data_t *ext;
 
     ext = &node->data.u.sta_node_data;
@@ -874,6 +889,7 @@ int process_ext_connect_algorithm(wifi_service_node_t *node)
     wifi_util_dbg_print(WIFI_SERVICES, "%s:%d process connection state: %s\r\n", __func__, __LINE__,
         ext_conn_state_to_str(ext->conn_state));
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! connection state:%s\n", __func__, __LINE__, ext_conn_state_to_str(ext->conn_state));
     switch (ext->conn_state) {
         case connection_state_disconnected_scan_list_none:
             ext_start_scan(node);
@@ -909,12 +925,14 @@ int process_ext_connect_algorithm(wifi_service_node_t *node)
             break;
     }
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
     return 0;
 }
 
 
 static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, wifi_core_data_t *data)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     bss_candidate_t *candidate;
     mesh_sta_node_data_t *ext;
     wifi_ctrl_t *ctrl;
@@ -937,6 +955,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
         wifi_util_info_print(WIFI_SERVICES, "%s:%d skip sta bssid change event: connection state: %s,"
             "vap: %s, bssid: %s\n", __func__, __LINE__, ext_conn_state_to_str(ext->conn_state),
             vap_info->vap_name, bssid_str);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return 0;
     }
 
@@ -952,6 +971,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
         wifi_util_info_print(WIFI_SERVICES, "%s:%d skip sta bssid change event, vap: %s, bssid: %s, "
             "enabled: %d\n", __func__, __LINE__, vap_info->vap_name, bssid_str,
             vap_info->u.sta_info.enabled);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return 0;
     }
 
@@ -961,6 +981,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
     if (freq == -1) {
         wifi_util_error_print(WIFI_SERVICES, "%s:%d failed to convert channel %d to frequency\n",
             __func__, __LINE__, channel);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return -1;
     }
 
@@ -991,6 +1012,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
     }
 
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_to_nb_in_progress\n", __func__, __LINE__);
     ext_set_conn_state(ext, connection_state_connection_to_nb_in_progress, __func__,
         __LINE__);
 
@@ -1003,6 +1025,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
             wifi_util_error_print(WIFI_SERVICES, "%s:%d sta disconnect failed for vap index: %d\n",
                 __func__, __LINE__, ext->connected_vap_index);
         }
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return 0;
     }
 
@@ -1010,6 +1033,7 @@ static int process_sta_webconfig_set_data_sta_bssid(wifi_service_node_t *node, w
         process_ext_connect_algorithm, node,
         EXT_CONNECT_ALGO_PROCESSOR_INTERVAL, 1, FALSE);
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
     return 0;
 }
 
@@ -1096,6 +1120,7 @@ void process_ext_connected_scan_results(wifi_service_node_t *node, wifi_core_dat
 
 int process_ext_scan_results(wifi_service_node_t *node, wifi_core_data_t *data)
 {
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     wifi_bss_info_t *bss;
     wifi_bss_info_t *tmp_bss;
     unsigned int i, num = 0;
@@ -1117,12 +1142,14 @@ int process_ext_scan_results(wifi_service_node_t *node, wifi_core_data_t *data)
 
     if (ext->conn_state == connection_state_connected_scan_list) {
         process_ext_connected_scan_results(node, data);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return 0;
     }
 
     if (ext->conn_state >= connection_state_disconnected_scan_list_all) {
         wifi_util_error_print(WIFI_SERVICES, "%s:%d Received scan resuts when already have result or connection in progress, should not happen\n",
                         __FUNCTION__,__LINE__);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return 0;
     }
 
@@ -1185,6 +1212,7 @@ int process_ext_scan_results(wifi_service_node_t *node, wifi_core_data_t *data)
                         EXT_SCAN_RESULT_WAIT_TIMEOUT, 1, FALSE);
     }
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
     return 0;
 }
 
@@ -1279,6 +1307,7 @@ int process_ext_exec_timeout(wifi_service_node_t *node, wifi_core_data_t *data)
 int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *data)
 {
 #ifdef FIXME
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0<-\n", __func__, __LINE__);
     wifi_vap_info_map_t *vap_map;
     wifi_vap_info_t *temp_vap_info = NULL;
     rdk_sta_data_t *sta_data = (rdk_sta_data_t *)data->msg;
@@ -1320,6 +1349,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
             if (temp_vap_info->u.sta_info.conn_status == sta_data->stats.connect_status &&
                 memcmp(temp_vap_info->u.sta_info.bssid, sta_data->bss_info.bssid, sizeof(bssid_t)) == 0) {
                 wifi_util_info_print(WIFI_SERVICES, "%s:%d: received duplicated wifi_event_hal_sta_conn_status event\n", __func__, __LINE__);
+                wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
                 return 0;
             }
             temp_vap_info->u.sta_info.conn_status = sta_data->stats.connect_status;
@@ -1338,6 +1368,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
 
     if (temp_vap_info == NULL) {
         wifi_util_error_print(WIFI_SERVICES, "%s:%d: temp_vap_info is NULL \n", __func__, __LINE__);
+        wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
         return RETURN_ERR;
     }
 
@@ -1440,10 +1471,12 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
 
             if (ext->conn_state == connection_state_connected && ext->connected_vap_index != sta_data->stats.vap_index) {
                 wifi_util_info_print(WIFI_SERVICES, "%s:%d: vap index %d is connected and received disconnection event on vap index %d\n", __func__, __LINE__, ext->connected_vap_index, sta_data->stats.vap_index);
+                wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
                 return 0;
             }
             candidate = &ext->last_connected_bss;
             found_candidate = true;
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_to_lcb_in_progress\n", __func__, __LINE__);
             ext_set_conn_state(ext, connection_state_connection_to_lcb_in_progress, __func__,
                 __LINE__);
 
@@ -1473,6 +1506,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
                 candidate++;
             }
         } else if (ext->conn_state == connection_state_disconnection_in_progress) {
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_in_progress\n", __func__, __LINE__);
             ext_set_conn_state(ext, connection_state_connection_in_progress, __func__, __LINE__);
             candidate = ext->candidates_list.scan_list;
             found_candidate = true;
@@ -1502,6 +1536,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
         if (rc != bus_error_success) {
             wifi_util_dbg_print(WIFI_SERVICES, "%s:%d: bus_event_publish_fn Event failed rc:%d\n",
                 __func__, __LINE__, rc);
+            wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
             return RETURN_ERR;
         }
     }
@@ -1517,6 +1552,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
                 // connection to new bssid is done before disconnection so the last bssid
                 // still can be connected
                 if (!is_connected_to_bssid(ext)) {
+                    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_to_lcb_in_progress\n", __func__, __LINE__);
                     ext_set_conn_state(ext, connection_state_connection_to_lcb_in_progress,
                         __func__, __LINE__);
                     candidate = &ext->last_connected_bss;
@@ -1553,6 +1589,7 @@ int process_ext_sta_conn_status(wifi_service_node_t *node, wifi_core_data_t *dat
             __LINE__, ext_conn_state_to_str(ext->conn_state));
     }
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! 0->\n", __func__, __LINE__);
 #endif
 
     return 0;
@@ -1659,6 +1696,7 @@ int process_ext_webconfig_set_data_sta_bssid(wifi_service_node_t *node, wifi_cor
         ext->channel_change_pending_map |= 1 << ext->connected_vap_index;
     }
 
+    wifi_util_info_print(WIFI_CTRL,"%s:%d: !!!!!! setting state to connection_state_connection_to_nb_in_progress\n", __func__, __LINE__);
     ext_set_conn_state(ext, connection_state_connection_to_nb_in_progress, __func__,
         __LINE__);
 

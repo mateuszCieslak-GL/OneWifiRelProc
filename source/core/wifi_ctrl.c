@@ -664,10 +664,11 @@ void bus_get_vap_init_parameter(const char *name, unsigned int *ret_val)
 #ifdef ONEWIFI_DEFAULT_NETWORKING_MODE
         *ret_val = ONEWIFI_DEFAULT_NETWORKING_MODE;
 #else
-        *ret_val = (unsigned int)global_param.device_network_mode;
+        // *ret_val = (unsigned int)global_param.device_network_mode;
+        *ret_val = rdk_dev_mode_type_ext;
 #endif
 #endif
-        ctrl->network_mode = (unsigned int)*ret_val;
+        ctrl->network_mode = (unsigned int)rdk_dev_mode_type_ext;
 
 #ifdef ONEWIFI_DEFAULT_DEVICE_TYPE
         ctrl->dev_type = ONEWIFI_DEFAULT_DEVICE_TYPE;
@@ -709,10 +710,11 @@ void bus_get_vap_init_parameter(const char *name, unsigned int *ret_val)
             return;
         }
 
-        *ret_val = data.raw_data.u32;
-        ctrl->network_mode = (unsigned int)*ret_val;
-        if (global_param.device_network_mode != (int)*ret_val) {
-            global_param.device_network_mode = (int)*ret_val;
+        // *ret_val = data.raw_data.u32;
+        *ret_val = rdk_dev_mode_type_ext;
+        ctrl->network_mode = (unsigned int)rdk_dev_mode_type_ext;
+        if (global_param.device_network_mode != (int)rdk_dev_mode_type_ext) {
+            global_param.device_network_mode = (int)rdk_dev_mode_type_ext;
             update_wifi_global_config(&global_param);
         }
     } else if (strcmp(name, WIFI_DEVICE_TUNNEL_STATUS) == 0) {
