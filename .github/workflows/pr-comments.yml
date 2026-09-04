@@ -272,6 +272,8 @@ jobs:
           RUN_NAME: ${{ needs.resolve.outputs.run_name }}
           RUN_NUMBER: ${{ needs.resolve.outputs.run_number }}
           RUN_URL: ${{ needs.resolve.outputs.run_url }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}       # for the develop-health gh api call (5b)
         run: |
           set -uo pipefail
           {
@@ -280,6 +282,34 @@ jobs:
             echo
             echo "_Commit \`${HEAD_SHA:0:7}\` · [\`${RUN_NAME}\` #${RUN_NUMBER}](${RUN_URL})_"
             echo
+
+            # --- Red-build attribution (Commit 5b), silent on green ---
+            # Only when a leg's OWN build step failed (its build-summary heading is
+            # "… — build failure"). Keyed on the leg outcome, NOT the workflow
+            # conclusion (which is also red for a clang-tidy gate hit on an
+            # otherwise-green build). Every API/jq failure degrades to silence, never red.
+            if grep -qE '^## .* build failure$' summaries/ci-summary-*/build-summary.md 2>/dev/null; then
+              # Is develop itself red right now? Then this PR is probably not the cause.
+              dev=$(gh api "/repos/${REPO}/actions/workflows/makefile.yml/runs?branch=develop&event=push&status=completed&per_page=1" 2>/dev/null || true)
+              concl=$(printf '%s' "$dev" | jq -r '.workflow_runs[0].conclusion // empty' 2>/dev/null || true)
+              url=$(printf '%s'  "$dev" | jq -r '.workflow_runs[0].html_url  // empty' 2>/dev/null || true)
+              when=$(printf '%s' "$dev" | jq -r '.workflow_runs[0].updated_at // empty' 2>/dev/null || true)
+              if [ "$concl" = "failure" ]; then
+                echo "❌ **develop itself is red** ([run](${url}), ${when}) — this PR is probably not the cause."
+                echo
+              elif [ "$concl" = "success" ]; then
+                echo "develop was ✅ green at ${when} ([run](${url}))."
+                echo
+              fi
+              # Per-leg verdicts, bpi first (it owns the definitive tier-2 verdict).
+              for leg in bpi rpi; do
+                a="summaries/ci-summary-${leg}/build-attribution.md"
+                [ -s "$a" ] || continue
+                cat "$a"
+                echo
+              done
+            fi
+
             # Deterministic platform order; each per-leg file carries its own
             # "## <platform> — build <outcome>" heading + error/warning blocks.
             for d in summaries/ci-summary-*/; do
