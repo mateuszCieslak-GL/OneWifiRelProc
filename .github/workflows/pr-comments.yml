@@ -357,6 +357,17 @@ jobs:
                 cat "$gcc"; echo
               fi
             fi
+
+            # --- Source coverage (advisory; only when the PR adds a source that
+            # no leg compiles). Its own ### section. Riding this one sticky makes
+            # the nudge unresolvable (issue comments have no Resolve button) and
+            # non-duplicating on re-push (the marker updates in place). ---
+            sc="ci-summary-bpi/source-coverage.md"
+            if [ -s "$sc" ]; then
+              echo "---"
+              echo
+              cat "$sc"; echo
+            fi
           } > ci-summary-comment.md
           echo "wrote ci-summary-comment.md ($(wc -l < ci-summary-comment.md) lines)"
 

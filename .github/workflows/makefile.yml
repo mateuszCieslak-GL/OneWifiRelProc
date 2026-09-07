@@ -484,6 +484,40 @@ jobs:
         # The script is fail-open (always exits 0); || true guards a python launch failure.
         python3 .github/scripts/build_attribution.py >> "$GITHUB_STEP_SUMMARY" || true
 
+    - name: Source-coverage nudge for ${{ matrix.platform.name }}
+      # Advisory, NEVER fails the build: flag a source file this PR ADDS that a
+      # Makefile.am lists but neither leg compiles — a likely-forgotten build
+      # makefile entry. Runs on the bpi leg only (its checkout carries both legs'
+      # makefiles); writes ci-out/source-coverage.md into the artifact for the
+      # trusted stage-2 job to fold into the one ci-summary sticky.
+      if: always() && github.event_name == 'pull_request' && matrix.platform.clang_tidy
+      working-directory: easymesh_project/OneWifi
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -uo pipefail
+        mkdir -p ci-out
+        if [ ! -f .github/scripts/source_coverage.py ]; then
+          exit 0
+        fi
+        : > ci-out/added-sources.txt
+        if [ -n "$BASE" ]; then
+          git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
+          # Same effective-base logic as the gcc/tidy steps (HEAD^1 on a merge ref).
+          DIFF_BASE="$BASE"
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null \
+             && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
+            DIFF_BASE=HEAD^1
+          fi
+          git diff --name-only --diff-filter=A "$DIFF_BASE" HEAD -- '*.c' '*.cpp' '*.cc' \
+            > ci-out/added-sources.txt 2>/dev/null || true
+        fi
+        # Writes ci-out/source-coverage.md only on a finding; always exits 0.
+        python3 .github/scripts/source_coverage.py ci-out/added-sources.txt || true
+        if [ -s ci-out/source-coverage.md ]; then
+          cat ci-out/source-coverage.md >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     # ---- Hand-off to the trusted PR-comment stage (pr-comments.yml) ----------
     # Record the PR identity as passive data for the workflow_run poster to
     # validate. Only meaningful on PRs; push builds skip it.
