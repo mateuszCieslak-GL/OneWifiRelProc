@@ -23,7 +23,8 @@ Gate not-yet-promoted gcc warning classes on the PR's changed lines *only*, with
 promoting them tree-wide. The OneWifi tree still carries backlogs for these classes
 (e.g. -Wvla: 18 sites, -Wreturn-type: 11), so a whole-file/tree -Werror would red every
 PR. Instead lets recompile each changed .c/.cpp from compile_commands.json with the candidate
-warnings enabled, then keep only findings whose line the PR actually changed.
+warnings enabled (non-fatal: the DB's own -Werror=<class> promotions are stripped and -Os is
+applied when OPT is set — see recompile_cmd), then keep only findings whose line the PR changed.
 A PR can then fail on a class that fires on a line it changed. NB this is
 line-scoped, not base-compared: a warning already present on a line the PR
 edits for an unrelated reason also counts (accepted trade-off, not literally
@@ -40,11 +41,14 @@ Env:
   GATE_WARNINGS      space-separated -W flags that FAIL the job when introduced on a changed line
   ADVISORY_WARNINGS  space-separated -W flags that are only reported
   ENFORCE            'false' -> advisory (render ❌ but exit 0). default enforce
+  OPT                optimization level for the recompile only (e.g. '-Os' to match
+                     production and wake middle-end warnings). Empty -> keep the DB's -O.
   REPO_DIR           dir the changed files + git history live in (default '.'; the HAL sets
                      this to '../rdk-wifi-hal' since its DB lives in the cloned OneWifi cwd)
   INLINE_JSON        optional path; when set, also write a review_poster.py candidate
-                     envelope (source 'gcc-gate') of the gate/advisory findings so they can
-                     be posted as inline PR review comments (Commit 5). Empty/unset -> no file.
+                     envelope (source 'gcc-gate') of the ADVISORY findings so they can be
+                     posted as inline PR review comments (Commit 5). GATED findings are
+                     summary-only, never inline. Empty/unset -> no file.
 Exit: 1 iff a GATE class fired on a changed line (and ENFORCE); else 0. Always writes a
 markdown summary to stdout. Identical file ships in OneWifi and the HAL — the INLINE_JSON
 support must be re-ported verbatim when this file is synced to the HAL.
@@ -67,6 +71,13 @@ ENFORCE = os.environ.get("ENFORCE", "true").strip().lower() not in ("false", "0"
 # '../rdk-wifi-hal' for the HAL (its DB is built in the cloned OneWifi cwd, cross-dir).
 REPO_DIR = os.environ.get("REPO_DIR", ".").strip() or "."
 DB = "compile_commands.json"
+# Optimization level for the RECOMPILE ONLY (not the real build). Production bpi/rpi
+# compile at -Os, but CI's compile DB is -O0, so every middle-end (post-optimization)
+# warning is dormant: -Wstringop-*, -Warray-bounds, -Wmaybe-uninitialized, -Wdangling-
+# pointer, -Wuse-after-free. Setting OPT=-Os in the workflow wakes them on the changed
+# files at production's exact level, without touching the build product or the silent
+# baseline the build-summary relies on. Empty (the default) keeps the DB's own -O.
+OPT = os.environ.get("OPT", "").strip()
 # When set, write inline-review candidates here (Commit 5). Same envelope
 # review_poster.py reads; source 'gcc-gate' gives it top posting priority.
 INLINE_JSON = os.environ.get("INLINE_JSON", "").strip()
@@ -75,9 +86,17 @@ INLINE_JSON = os.environ.get("INLINE_JSON", "").strip()
 GATE_TAGS = {f"[{w}]" for w in GATE}
 ADVISORY_TAGS = {f"[{w}]" for w in ADVISORY}
 ALL_FLAGS = GATE + ADVISORY
-# Demote every candidate to a warning so the recompile never errors out mid-file.
-NO_ERROR = [f"-Wno-error={w[2:]}" for w in ALL_FLAGS]
-LINE_RE = re.compile(r"\.(?:c|cpp):(\d+):")
+# C++ TU extensions. gcc rejects a few -W flags for C++ ("valid for C/ObjC but not for
+# C++") — harmless (g++ warns and continues, exit 0) but noisy; drop them on C++ TUs.
+CXX_EXT = (".cpp", ".cc", ".cxx")
+# Flags gcc accepts for C only. Kept explicit (not probed) so a reader sees which
+# classes protect C sources; verified on gcc 13.3.0.
+C_ONLY = {
+    "-Wint-conversion", "-Wimplicit-function-declaration", "-Wimplicit-int",
+    "-Wincompatible-pointer-types", "-Wpointer-sign", "-Wdiscarded-qualifiers",
+    "-Wjump-misses-init",
+}
+LINE_RE = re.compile(r"\.(?:c|cc|cpp|cxx):(\d+):")
 TAG_RE = re.compile(r"\[-W[a-z0-9-]+\]")
 # Parse a normalized `disp` line (path already stripped) into inline-comment fields.
 INLINE_RE = re.compile(r"^(?P<path>[^:]+):(?P<line>\d+):\d+: warning: (?P<msg>.*) \[(?P<tag>-W[a-z0-9-]+)\]$")
@@ -105,8 +124,14 @@ def write_inline(status, comments, dropped=0):
               file=sys.stderr)
 
 
-def build_inline(gated, advis):
-    """Turn the deduped gate/advisory display lines into inline candidates.
+def build_inline(advis):
+    """Turn the deduped ADVISORY display lines into inline candidates.
+
+    GATED findings are NOT inlined — they go to the summary only: the gate's ❌ block
+    already prints file:line, the red check (not a resolvable comment) is the
+    enforcement, and an author-resolvable comment on an enforced finding only invites
+    "clicked resolve, nothing happened" confusion. Inline is for the low-stakes
+    advisory that an author may reasonably clear.
 
     One comment per (path, line, tag, msg): gcc repeats a finding at several
     columns on macro expansion, so dedupe on those four fields (dropping the
@@ -115,23 +140,49 @@ def build_inline(gated, advis):
     counted as 'dropped' (surfaced in the poster's summary), never silently lost.
     """
     inline, seen, dropped = [], set(), 0
-    for sev, lst in (("gate", gated), ("advisory", advis)):
-        for d in lst:
-            m = INLINE_RE.match(d)
-            if not m:
-                dropped += 1
-                continue
-            key = (m["path"], int(m["line"]), m["tag"], m["msg"])
-            if key in seen:
-                continue
-            seen.add(key)
-            inline.append({
-                "path": m["path"],
-                "line": int(m["line"]),
-                "side": "RIGHT",
-                "body": f"🚦 **gcc** `{m['tag']}` ({sev}) — {m['msg']}",
-            })
+    for d in advis:
+        m = INLINE_RE.match(d)
+        if not m:
+            dropped += 1
+            continue
+        key = (m["path"], int(m["line"]), m["tag"], m["msg"])
+        if key in seen:
+            continue
+        seen.add(key)
+        inline.append({
+            "path": m["path"],
+            "line": int(m["line"]),
+            "side": "RIGHT",
+            "body": f"🚦 **gcc** `{m['tag']}` (advisory) — {m['msg']}",
+        })
     return inline, dropped
+
+
+def recompile_cmd(args, path):
+    """The per-file recompile command for one changed TU.
+
+    `args` is the DB command already minus -c/-o (from db_args). This recompile only
+    COLLECTS warnings, so no diagnostic may abort it. Two mechanisms are needed:
+
+      * STRIP every -Werror* token from args. The DB carries 13 distinct -Werror=<class>
+        promotions (incl. -Werror=maybe-uninitialized / -array-bounds that -Os newly
+        trips). A bare -Wno-error does NOT undo a per-class -Werror=<class> (verified
+        gcc 13.3.0: `-Werror=return-type -Wno-error` still errors), so drop them outright.
+      * KEEP a per-class -Wno-error=<class> for every candidate. On gcc-14 the classes
+        int-conversion / implicit-function-declaration / implicit-int /
+        incompatible-pointer-types are errors BY DEFAULT (no -Werror= involved), so the
+        strip above does not cover them — the explicit -Wno-error= does.
+
+    A genuine error (missing header, killed compiler) is not a -Werror promotion and
+    still exits nonzero -> the caller's failed[] path. -Os is added when OPT is set;
+    the C-only flags are dropped for C++ TUs (g++ rejects them).
+    """
+    is_cxx = path.endswith(CXX_EXT)
+    flags = [w for w in ALL_FLAGS if not (is_cxx and w in C_ONLY)]
+    no_error = [f"-Wno-error={w[2:]}" for w in flags]
+    opt = [OPT] if OPT else []
+    kept = [a for a in args if not a.startswith("-Werror")]
+    return kept + opt + ["-c", "-o", os.devnull] + flags + no_error
 
 
 def effective_base():
@@ -263,7 +314,7 @@ def main():
         want = changed_lines(base, f)
         if not want:
             continue
-        cmd = args + ["-c", "-o", os.devnull] + ALL_FLAGS + NO_ERROR
+        cmd = recompile_cmd(args, f)
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         for line in r.stderr.splitlines():
             if ": warning:" not in line and ": error:" not in line:
@@ -287,8 +338,9 @@ def main():
             elif tag in ADVISORY_TAGS:
                 advis.append(disp)
         if r.returncode != 0:
-            # Every candidate class is demoted with -Wno-error=, so a well-formed
-            # recompile of an already-built file exits 0. A nonzero code is a
+            # Every -Werror promotion is stripped from the DB args and each candidate
+            # class is also demoted with -Wno-error=, so a well-formed recompile of an
+            # already-built file exits 0. A nonzero code is a
             # MECHANISM failure, not a clean file: gcc aborts with "unrecognized
             # command-line option" for a clang-only/mistyped GATE/ADVISORY entry
             # (which would otherwise silently disable the gate for EVERY file), or
@@ -307,7 +359,7 @@ def main():
 
     # Inline-review candidates (Commit 5). Written on every non-skip path — including
     # the clean case (empty list) so the poster removes any now-stale gcc comments.
-    inline, inline_dropped = build_inline(gated, advis)
+    inline, inline_dropped = build_inline(advis)
     write_inline("ok", inline, inline_dropped)
 
     # GitHub annotations (top-of-check box).
