@@ -501,6 +501,11 @@ jobs:
         # Inline-review candidates (Commit 5) for the stage-2 'inline' job. Lands in
         # ci-out/ (uploaded as ci-summary-bpi). Absent/unset -> the script writes none.
         INLINE_JSON: "ci-out/inline-gcc.json"
+        # Second, time-boxed gcc -fanalyzer pass per changed file: null-deref/leak/OOB via
+        # symbolic execution. Informational only (summary-only, never gates, never inline --
+        # path-sensitive, flickers with gcc version). Changed-lines-scoped, so a PR pays only
+        # for its files (~0.25s median, worst ~16s on a giant file, capped by ANALYZER_TIMEOUT).
+        ANALYZER: 'true'
       run: |
         set -uo pipefail
         mkdir -p ci-out

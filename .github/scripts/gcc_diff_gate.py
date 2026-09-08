@@ -43,6 +43,9 @@ Env:
   ENFORCE            'false' -> advisory (render ❌ but exit 0). default enforce
   OPT                optimization level for the recompile only (e.g. '-Os' to match
                      production and wake middle-end warnings). Empty -> keep the DB's -O.
+  ANALYZER           truthy ('1'/'true'/...) -> also run a time-boxed gcc -fanalyzer pass
+                     per changed file (informational: summary-only, never gates/inlines).
+  ANALYZER_TIMEOUT   per-file -fanalyzer wall-clock cap in seconds (default 90).
   REPO_DIR           dir the changed files + git history live in (default '.'; the HAL sets
                      this to '../rdk-wifi-hal' since its DB lives in the cloned OneWifi cwd)
   INLINE_JSON        optional path; when set, also write a review_poster.py candidate
@@ -98,6 +101,17 @@ C_ONLY = {
 }
 LINE_RE = re.compile(r"\.(?:c|cc|cpp|cxx):(\d+):")
 TAG_RE = re.compile(r"\[-W[a-z0-9-]+\]")
+# -fanalyzer informational pass (Commit 3): a SEPARATE recompile with gcc's symbolic
+# execution engine. Summary-only -- never gates, never inline (path-sensitive: findings
+# flicker with gcc version / inlining). Enabled by ANALYZER; time-boxed per file since the
+# engine can be slow on huge files (nl80211.c ~16s). Findings tag [-Wanalyzer-*].
+ANALYZER = os.environ.get("ANALYZER", "").strip().lower() in ("1", "true", "yes", "on")
+ANALYZER_FLAGS = ["-fanalyzer", "-fanalyzer-verbosity=1"]
+try:
+    ANALYZER_TIMEOUT = int(os.environ.get("ANALYZER_TIMEOUT", "90") or "90")
+except ValueError:
+    ANALYZER_TIMEOUT = 90
+ANALYZER_TAG_RE = re.compile(r"\[-Wanalyzer-[a-z0-9-]+\]")
 # Parse a normalized `disp` line (path already stripped) into inline-comment fields.
 INLINE_RE = re.compile(r"^(?P<path>[^:]+):(?P<line>\d+):\d+: warning: (?P<msg>.*) \[(?P<tag>-W[a-z0-9-]+)\]$")
 
@@ -183,6 +197,21 @@ def recompile_cmd(args, path):
     opt = [OPT] if OPT else []
     kept = [a for a in args if not a.startswith("-Werror")]
     return kept + opt + ["-c", "-o", os.devnull] + flags + no_error
+
+
+def analyzer_cmd(args, path):
+    """The per-file command for the -fanalyzer informational pass (Commit 3).
+
+    Kept SEPARATE from recompile_cmd: -Wanalyzer-* findings are their own group (no
+    candidate -W flags needed) and the pass is time-boxed by the caller. As in
+    recompile_cmd, every -Werror promotion is stripped and a bare -Wno-error added so no
+    class can abort it; -Os is applied when OPT is set (analyzer results are opt-sensitive,
+    so match the warning pass). gcc 13's -fanalyzer runs on C++ TUs too (verified on
+    matrix.cpp: no 'experimental' noise, real findings), so no per-language gating; `path`
+    is unused today but kept for symmetry / future per-language tuning."""
+    kept = [a for a in args if not a.startswith("-Werror")]
+    opt = [OPT] if OPT else []
+    return kept + opt + ANALYZER_FLAGS + ["-Wno-error", "-c", "-o", os.devnull]
 
 
 def effective_base():
@@ -306,6 +335,7 @@ def main():
     base = effective_base()
     db = json.load(open(DB))
     gated, advis, failed = [], [], []
+    analyzer, analyzer_failed = [], []
     for f in changed_files(base):
         info = db_args(db, f)
         if not info:
@@ -353,9 +383,31 @@ def main():
                            if ": error:" in ln), f"compiler exit {r.returncode}")
             reason = re.sub(r"^[^ ]*/(?:OneWifi|rdk-wifi-hal)/+", "", reason)  # same path-strip as disp
             failed.append(f"{f}: {reason}")
+        if ANALYZER:
+            # Second, time-boxed recompile: the -fanalyzer engine, changed-lines-scoped
+            # like the warning pass. Informational only -> collected separately, never
+            # gated/inlined. A timeout leaves this file's analyzer coverage partial (noted),
+            # never reds the job. The warning findings above are already recorded.
+            try:
+                ar = subprocess.run(analyzer_cmd(args, f), cwd=cwd,
+                                    capture_output=True, text=True,
+                                    timeout=ANALYZER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                analyzer_failed.append(f"{f}: -fanalyzer timed out after {ANALYZER_TIMEOUT}s")
+            else:
+                for line in ar.stderr.splitlines():
+                    if ": warning:" not in line:
+                        continue
+                    m = LINE_RE.search(line)
+                    t = ANALYZER_TAG_RE.search(line)
+                    if not m or not t or not _in_intervals(int(m.group(1)), want):
+                        continue
+                    analyzer.append(re.sub(r"^[^ ]*/(?:OneWifi|rdk-wifi-hal)/+", "", line))
     gated = sorted(set(gated))
     advis = sorted(set(advis))
     failed = sorted(set(failed))
+    analyzer = sorted(set(analyzer))
+    analyzer_failed = sorted(set(analyzer_failed))
 
     # Inline-review candidates (Commit 5). Written on every non-skip path — including
     # the clean case (empty list) so the poster removes any now-stale gcc comments.
@@ -367,11 +419,16 @@ def main():
         print(f"::error::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
     for l in advis[:10]:
         print(f"::warning::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
+    for l in analyzer[:10]:
+        print(f"::warning::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
     for l in failed[:10]:
         print(f"::warning::gcc diff-gate could not recompile — {l}"
               .replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
+    for l in analyzer_failed[:10]:
+        print(f"::warning::gcc diff-gate could not run -fanalyzer — {l}"
+              .replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
 
-    if not gated and not advis and not failed:
+    if not gated and not advis and not failed and not analyzer and not analyzer_failed:
         print("#### 🚦 gcc diff-gate: clean on changed lines")
         return 0
     if gated:
@@ -386,6 +443,18 @@ def main():
         print("```")
         print("\n".join(advis[:100]))
         print("```")
+    if analyzer:
+        print(f"#### 🔬 gcc -fanalyzer (informational) — {len(analyzer)}")
+        print("_Path-sensitive; advisory only, never gates or posts inline. Review in the Files tab._")
+        print("<details><summary>show findings</summary>")
+        print()
+        print("```")
+        print("\n".join(analyzer[:20]))
+        print("```")
+        print("</details>")
+    if analyzer_failed:
+        print(f"_-fanalyzer skipped {len(analyzer_failed)} file(s) (timeout >= {ANALYZER_TIMEOUT}s) — "
+              "informational coverage partial._")
     if failed:
         print(f"#### ⚠️ gcc diff-gate: {len(failed)} file(s) failed to recompile — coverage incomplete")
         print("```")

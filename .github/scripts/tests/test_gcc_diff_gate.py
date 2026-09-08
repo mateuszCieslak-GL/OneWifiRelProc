@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Copyright 2026 RDK Management — Apache-2.0 (see gcc_diff_gate.py header).
 """Unit tests for gcc_diff_gate.py: build_inline (ADVISORY-only inline candidates,
-column dedupe, dropped count), recompile_cmd (-Os insertion, bare -Wno-error, C-only
-flags dropped on C++ TUs) and write_inline (envelope shape, skipped vs ok, no-op when
-INLINE_JSON is unset)."""
+column dedupe, dropped count), recompile_cmd (-Os insertion, -Werror strip, C-only flags
+dropped on C++ TUs), analyzer_cmd (-fanalyzer pass flags + -Werror strip) and write_inline
+(envelope shape, skipped vs ok, no-op when INLINE_JSON is unset)."""
 import json
 import os
 import sys
@@ -87,6 +87,28 @@ class RecompileCmd(unittest.TestCase):
         cmd = g.recompile_cmd(["gcc", "-Werror=format", "foo.c"], "source/foo.c")
         self.assertNotIn("-Os", cmd)
         self.assertNotIn("-Werror=format", cmd)          # still strips promotions
+
+
+class AnalyzerCmd(unittest.TestCase):
+    def setUp(self):
+        self._saved = g.OPT
+        g.OPT = "-Os"
+
+    def tearDown(self):
+        g.OPT = self._saved
+
+    def test_fanalyzer_flags_opt_and_werror_strip(self):
+        cmd = g.analyzer_cmd(["gcc", "-Werror", "-Werror=maybe-uninitialized", "foo.c"],
+                             "source/foo.c")
+        self.assertIn("-fanalyzer", cmd)
+        self.assertIn("-fanalyzer-verbosity=1", cmd)
+        self.assertIn("-Os", cmd)                        # OPT applied to the analyzer pass too
+        self.assertNotIn("-Werror", cmd)                 # promotions stripped
+        self.assertNotIn("-Werror=maybe-uninitialized", cmd)
+        self.assertIn("-Wno-error", cmd)                 # bare, defensive
+        self.assertIn(os.devnull, cmd)
+        # no candidate -W flags: the analyzer emits its own -Wanalyzer-* group
+        self.assertNotIn("-Wvla", cmd)
 
 
 class WriteInline(unittest.TestCase):
