@@ -290,12 +290,15 @@ jobs:
       if: always() && matrix.platform.clang_tidy
       working-directory: easymesh_project/OneWifi
       run: |
-        # Two-tier clang-tidy over PR-changed .c/.cpp files (see .clang-tidy):
-        #   * WarningsAsErrors checks    -> `error:`   -> FATAL (this step fails the job)
-        #   * rest of enabled bugprone-* -> `warning:` -> advisory only
-        # clang-diagnostic-* (most false positives and most noisy) is filtered out so it can NEVER
-        # gate. The gate is changed-LINES-scoped: a PR can only fail on a .c/.cpp LINE it touched
-        # (the per-file `lines=` filter below), so pre-existing findings on untouched lines never red it.
+        # Three-tier clang-tidy over PR-changed .c/.cpp files (see .clang-tidy + EXTRA_CHECKS below):
+        #   * WarningsAsErrors checks       -> `error:`   -> FATAL (this step fails the job)
+        #   * advisory bugprone-*           -> `warning:` -> advisory (also inline)
+        #   * clang-analyzer-* / unreachable -> `warning:` -> INFORMATIONAL (summary-only, never
+        #                                       gates, never inline; path-sensitive so it flickers)
+        # clang-diagnostic-* is filtered out (clang-vs-gcc parse errors, unbuilt-file noise) EXCEPT
+        # the armed unreachable-code group, which the allow-list keeps as the dead-code proxy; it
+        # can never gate (it prints `warning:`, not `error:`). The gate is changed-LINES-scoped: a PR
+        # can only fail on a .c/.cpp LINE it touched, so pre-existing findings on untouched lines never red it.
         mkdir -p ci-out
         if [ ! -f compile_commands.json ]; then
           echo "#### 🔎 clang-tidy: no compile DB" >> "$GITHUB_STEP_SUMMARY"
@@ -320,15 +323,14 @@ jobs:
              && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
             DIFF_BASE=HEAD^1
           fi
-          # Changed file not present in compile_commands.json (not built) falls back to default
-          # flags. A real source then can't resolve its includes -> a fatal clang-diagnostic
-          # aborts file parsing before any check run on it -> that output is dropped by the
-          # clang-diagnostic filter below -> file can't fail. Thus, only built files are judged.
+          # Changed file not present in compile_commands.json (not built) is skipped explicitly by
+          # the per-file DB-presence guard in the loop below (it used to self-skip via the blanket
+          # clang-diagnostic filter, but the allow-list now keeps unreachable-code, so an unbuilt
+          # file's misparse could otherwise leak an FP). Only built files are judged either way.
           # Exclude only the vendored hostap tree (sibling clone rdk-wifi-libhostap/), never
           # first-party sources: '^build/' wrongly dropped build/linux/compat/coverage_stubs.c
           # (compiled by the makefile, real DB entry) and bare 'hostap' dropped e.g.
-          # wifi_hostapd_glue.c. A changed file not in the DB self-skips (default-flags fallback
-          # -> fatal clang-diagnostic -> filtered below), so DB membership is the real gate.
+          # wifi_hostapd_glue.c. DB membership (checked in the loop) is the real gate.
           # Anchored '^': git diff paths are repo-relative and the vendored tree, if ever
           # surfaced, sits at the repo root -- so a first-party path that merely *contains*
           # the name (e.g. source/.../rdk-wifi-libhostap-notes.c) is never dropped.
@@ -341,13 +343,38 @@ jobs:
         # scope because the awk filter below runs on output, not input.
         # See clang-tidy-hal-extra-mechanism memory for the proof + HAL usage.
         EXTRA_WAE=''       # comma-separated bugprone checks to gate (empty = baseline only)
-        EXTRA_CHECKS=''    # checks to ENABLE that .clang-tidy doesn't (e.g. clang-analyzer-*)
+        # Informational (advisory-only) additions. All three are path-sensitive or a
+        # dead-code proxy -> summary-only, NEVER gated, and excluded from inline by
+        # tidy_to_inline.py (they flicker with analyzer version / inlining). Split out of
+        # the advisory bucket below by tag.
+        #   clang-analyzer-core.*/unix.*  path-sensitive symbolic execution (null deref,
+        #                                 malloc misuse); needs the parse-unblock below.
+        #   clang-analyzer-deadcode.DeadStores  dead STORES (value set, never read).
+        #   clang-diagnostic-unreachable-code*  unreachable STATEMENTS (the dead-code proxy
+        #                                 the plain filter used to drop; armed below).
+        EXTRA_CHECKS='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-deadcode.DeadStores,clang-diagnostic-unreachable-code*'
         extra=()
         [ -n "$EXTRA_WAE" ]    && extra+=(--warnings-as-errors="$EXTRA_WAE")
         [ -n "$EXTRA_CHECKS" ] && extra+=(--checks="$EXTRA_CHECKS")
+        # clang-analyzer parse-unblock (same as the HAL): the DB promotes clang's
+        # const-discard assignments to errors via -Werror=incompatible-pointer-types,
+        # which makes the analyzer engine bail on the file ("Error while processing") with
+        # 0 findings -> demote just that one diagnostic. Harmless when no analyzer check runs.
+        extra+=( '--extra-arg=-Wno-error=incompatible-pointer-types-discards-qualifiers' )
+        # Arm -Wunreachable-code so clang-diagnostic-unreachable-code* has something to
+        # report (clang emits nothing for the group unless the warning is on). -aggressive
+        # widens it to returns/loops; still advisory, so its FPs never gate.
+        extra+=( '--extra-arg=-Wunreachable-code' '--extra-arg=-Wunreachable-code-aggressive' )
         : > tidy.log
         for f in $CHANGED; do
           [ -f "$f" ] || continue
+          # DB-presence guard: the allow-list below now KEEPS clang-diagnostic-unreachable-code
+          # (it used to drop every clang-diagnostic). A changed file absent from the compile DB
+          # runs with default flags, misparses, and could then leak an unreachable-code FP, so
+          # skip it here (it used to self-skip via the blanket clang-diagnostic filter). DB paths
+          # are absolute and end in the repo-relative path; paths are assumed quote-free (as
+          # elsewhere in this step -- `for f in $CHANGED` is itself unquoted).
+          grep -qF "/$f\"" compile_commands.json || continue
           # new-side line numbers this PR changed in *this* file (zero-context hunks)
           lines=$(git diff -U0 --diff-filter=ACM "$DIFF_BASE" HEAD -- "$f" 2>/dev/null \
                   | awk '/^@@ /{c=$3;sub(/^\+/,"",c);n=1;if(c~/,/){split(c,a,",");c=a[1];n=a[2]}
@@ -357,13 +384,22 @@ jobs:
           # clang-tidy runs one file at a time -> every finding is this file's, so keep only the
           # ones whose LINE the PR changed. Filter on the line number alone: matching the
           # sed-normalized display path against git-diff paths is fragile (silently drops all).
+          # Allow-list filter (was `grep -v clang-diagnostic`): still drop every clang-diagnostic
+          # (clang-vs-gcc parse errors, unbuilt-file include floods) EXCEPT the armed
+          # unreachable-code group, so the dead-code proxy survives while the noise stays out.
           clang-tidy-18 -p . "${extra[@]}" --quiet "$f" 2>/dev/null \
-            | grep -E ': (warning|error):' | grep -v clang-diagnostic \
+            | grep -E ': (warning|error):' \
+            | awk '!/clang-diagnostic/ || /clang-diagnostic-unreachable-code/' \
             | awk -F: -v L="$lines" 'BEGIN{split(L,a," ");for(i in a)k[a[i]]} ($2 in k)' >> tidy.log || true
         done
         # WarningsAsErrors-promoted checks print as `error:`; everything else as `warning:`.
-        gated=$(grep -E ': error:'   tidy.log | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' | sort -u || true)
-        advis=$(grep -E ': warning:' tidy.log | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' | sort -u || true)
+        # Three buckets. error: -> gated (the .clang-tidy WarningsAsErrors set). warning: is
+        # split by tag: clang-analyzer-* / clang-diagnostic-unreachable-code -> INFORMATIONAL
+        # (path-sensitive; summary-only, never inline, never gated); everything else -> advisory.
+        _norm='s#[^ ]*/OneWifi/+##; s#//#/#g'
+        gated=$(grep -E ': error:'   tidy.log | sed -E "$_norm" | sort -u || true)
+        info=$(grep  -E ': warning:' tidy.log | grep -E  '\[(clang-analyzer-|clang-diagnostic-unreachable-code)' | sed -E "$_norm" | sort -u || true)
+        advis=$(grep -E ': warning:' tidy.log | grep -vE '\[(clang-analyzer-|clang-diagnostic-unreachable-code)' | sed -E "$_norm" | sort -u || true)
         if [ -n "$gated" ]; then
           printf '%s\n' "$gated" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
             | while IFS= read -r l; do echo "::error::$l"; done
@@ -372,9 +408,15 @@ jobs:
           printf '%s\n' "$advis" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
             | while IFS= read -r l; do echo "::warning::$l"; done
         fi
+        # Informational findings as annotations too: unresolvable, land in the Files tab,
+        # and add no resolvable review-thread clutter. Per-run, so analyzer flicker is harmless.
+        if [ -n "$info" ]; then
+          printf '%s\n' "$info" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
+            | while IFS= read -r l; do echo "::warning::$l"; done
+        fi
         {
-          if   [ -z "$CHANGED" ];     then echo "#### 🔎 clang-tidy: no changed .c/.cpp to scan"
-          elif [ -z "$gated$advis" ]; then echo "#### 🔎 clang-tidy: clean on changed lines"
+          if   [ -z "$CHANGED" ];          then echo "#### 🔎 clang-tidy: no changed .c/.cpp to scan"
+          elif [ -z "$gated$advis$info" ]; then echo "#### 🔎 clang-tidy: clean on changed lines"
           else
             if [ -n "$gated" ]; then
               echo "#### ❌ clang-tidy gate — $(printf '%s\n' "$gated" | wc -l) fatal"
@@ -384,6 +426,13 @@ jobs:
             if [ -n "$advis" ]; then
               echo "#### 🔎 clang-tidy advisory — $(printf '%s\n' "$advis" | wc -l) findings"
               echo '```'; printf '%s\n' "$advis" | head -100; echo '```'
+            fi
+            if [ -n "$info" ]; then
+              echo "#### 🔬 clang-analyzer / dead-code (informational) — $(printf '%s\n' "$info" | wc -l)"
+              echo "_Path-sensitive; advisory only, never gates or posts inline. Review in the Files tab._"
+              echo '<details><summary>show findings</summary>'; echo
+              echo '```'; printf '%s\n' "$info" | head -20; echo '```'
+              echo '</details>'
             fi
           fi
         } | tee ci-out/tidy-summary.md >> "$GITHUB_STEP_SUMMARY"

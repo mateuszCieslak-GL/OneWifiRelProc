@@ -25,11 +25,13 @@ kept only where the line number is one the PR changed). Each line looks like:
 
     /abs/.../OneWifi/source/foo.c:42:9: warning: message text [bugprone-xyz]
 
-`error:` lines are WarningsAsErrors-promoted checks (the gate); `warning:` lines
-are advisory. One comment per (path, line, check, msg): clang-tidy can print the
-same finding under several checks / columns, and review_poster does NOT dedupe
-candidates against each other, so a duplicate here would post a duplicate comment.
-A line that does not parse is counted 'dropped' (surfaced in the poster summary),
+Only ADVISORY findings become inline candidates. `error:` (gated) lines and the
+summary-only informational set (clang-analyzer-* and clang-diagnostic-unreachable-code*)
+are skipped as a policy choice -- see INLINE_EXCLUDE_PREFIX -- and, being policy not a
+parse failure, do NOT count as 'dropped'. One comment per (path, line, check, msg):
+clang-tidy can print the same finding under several checks / columns, and review_poster
+does NOT dedupe candidates against each other, so a duplicate here would post a duplicate
+comment. A line that does not parse IS counted 'dropped' (surfaced in the poster summary),
 never silently lost.
 
 Usage:  tidy_to_inline.py <tidy.log> <out.json>
@@ -50,6 +52,15 @@ LINE_RE = re.compile(
 # the runner checks out to .../OneWifi/OneWifi/easymesh_project/OneWifi/source/...
 PATH_STRIP_RE = re.compile(r"^[^ ]*/(?:OneWifi|rdk-wifi-hal)/+")
 
+# Findings that are SUMMARY-ONLY, never inline (see the makefile.yml routing). Gated
+# (`error:`) findings: the gate block already prints file:line and the red check enforces
+# them, so a resolvable inline comment only confuses. The path-sensitive analyzer set and
+# the unreachable-code dead-code proxy: they flicker with analyzer version / inlining, so a
+# resolvable per-line comment is the wrong surface (the sticky's informational section shows
+# them instead). Skipping these is a POLICY choice, not a parse failure, so it must NOT bump
+# `dropped` (which exists to surface genuine parse errors to the poster).
+INLINE_EXCLUDE_PREFIX = ("clang-analyzer-", "clang-diagnostic-unreachable-code")
+
 
 def parse(text):
     """Return (comments, dropped) from clang-tidy log text."""
@@ -62,15 +73,19 @@ def parse(text):
         if not m:
             dropped += 1
             continue
+        check = m["check"]
+        # Summary-only findings never become inline candidates (policy, not a parse
+        # failure -> do not touch `dropped`).
+        if m["sev"] == "error" or check.startswith(INLINE_EXCLUDE_PREFIX):
+            continue
         path = PATH_STRIP_RE.sub("", m["path"])
         lineno = int(m["line"])
-        check = m["check"]
         msg = m["msg"]
         key = (path, lineno, check, msg)
         if key in seen:
             continue
         seen.add(key)
-        sev = "gate" if m["sev"] == "error" else "advisory"
+        sev = "advisory"
         comments.append({
             "path": path,
             "line": lineno,

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Copyright 2026 RDK Management — Apache-2.0 (see tidy_to_inline.py header).
 """Unit tests for tidy_to_inline.py: parsing a filtered clang-tidy log into inline
-review candidates (gate/advisory split, path strip, dedupe, dropped count) and the
-missing-log -> skipped envelope."""
+review candidates (advisory-only; gated + analyzer + unreachable-code excluded without
+inflating dropped; path strip; dedupe; dropped count) and the missing-log -> skipped
+envelope."""
 import json
 import os
 import sys
@@ -16,19 +17,31 @@ ABS = "/home/runner/work/OneWifi/OneWifi/easymesh_project/OneWifi/"
 
 
 class Parse(unittest.TestCase):
-    def test_gate_advisory_and_pathstrip(self):
-        log = (
-            ABS + "source/foo.c:42:9: warning: 'x' set but not used [bugprone-a]\n"
-            + ABS + "source/bar.c:7:1: error: bad thing [bugprone-b]\n"
-        )
+    def test_advisory_inlined_and_pathstrip(self):
+        log = ABS + "source/foo.c:42:9: warning: 'x' set but not used [bugprone-a]\n"
         comments, dropped = t.parse(log)
         self.assertEqual(dropped, 0)
+        self.assertEqual(len(comments), 1)
         self.assertEqual(comments[0]["path"], "source/foo.c")   # stripped to repo-rel
         self.assertEqual(comments[0]["line"], 42)
         self.assertIn("(advisory)", comments[0]["body"])        # warning -> advisory
         self.assertIn("bugprone-a", comments[0]["body"])
-        self.assertIn("(gate)", comments[1]["body"])            # error   -> gate
         self.assertTrue(all(c["side"] == "RIGHT" for c in comments))
+
+    def test_summary_only_findings_excluded_not_dropped(self):
+        # gated (error), analyzer, and unreachable-code -> excluded from inline, and NOT
+        # counted as dropped (policy skip, not a parse failure). One advisory survives.
+        log = (
+            ABS + "source/g.c:7:1: error: bad [bugprone-b]\n"
+            + ABS + "source/a.c:9:2: warning: null deref [clang-analyzer-core.NullDereference]\n"
+            + ABS + "source/u.c:3:1: warning: code will never be executed [clang-diagnostic-unreachable-code]\n"
+            + ABS + "source/ok.c:5:5: warning: unused [bugprone-a]\n"
+        )
+        comments, dropped = t.parse(log)
+        self.assertEqual(dropped, 0)                        # none were parse failures
+        self.assertEqual(len(comments), 1)                  # only the advisory bugprone-a
+        self.assertEqual(comments[0]["path"], "source/ok.c")
+        self.assertIn("(advisory)", comments[0]["body"])
 
     def test_dedupes_same_finding(self):
         # Same finding twice (clang-tidy repeats across TUs / columns) -> one comment.
@@ -61,7 +74,7 @@ class MainIO(unittest.TestCase):
 
     def test_writes_ok_envelope(self):
         logfd, logp = tempfile.mkstemp(suffix=".log")
-        os.write(logfd, (ABS + "source/foo.c:1:1: error: e [c] \n").encode())
+        os.write(logfd, (ABS + "source/foo.c:1:1: warning: w [bugprone-c] \n").encode())
         os.close(logfd)
         out = self._tmp()
         self.assertEqual(t.main(["prog", logp, out]), 0)
@@ -69,7 +82,7 @@ class MainIO(unittest.TestCase):
             doc = json.load(fh)
         self.assertEqual(doc["status"], "ok")
         self.assertEqual(len(doc["comments"]), 1)
-        self.assertIn("(gate)", doc["comments"][0]["body"])
+        self.assertIn("(advisory)", doc["comments"][0]["body"])
 
 
 if __name__ == "__main__":

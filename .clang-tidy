@@ -9,7 +9,10 @@
 # When sources get cleaned, move a proven-clean check from advisory into
 # WarningsAsErrors (e.g. 'bugprone-not-null-terminated-result' once its sites
 # are fixed). 'clang-diagnostic-*' is filtered out by the workflow so compiler
-# frontend noise (incl. clang-vs-gcc parse errors) can never act as gate.
+# frontend noise (incl. clang-vs-gcc parse errors) can never act as gate -- with
+# one allow-listed exception, 'clang-diagnostic-unreachable-code*' (armed via
+# EXTRA_CHECKS as the dead-code proxy), which stays advisory/informational and,
+# printing 'warning:' not 'error:', still cannot gate.
 #
 # A deliberate hit on a gated check is waived inline: // NOLINT(<check-name>).
 # NOTE: findings are limited to changed .c/.cpp files (no HeaderFilterRegex), so
