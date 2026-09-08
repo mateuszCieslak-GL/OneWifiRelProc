@@ -591,6 +591,46 @@ jobs:
           cat ci-out/source-coverage.md >> "$GITHUB_STEP_SUMMARY"
         fi
 
+    - name: Complexity delta for ${{ matrix.platform.name }}
+      # Advisory, NEVER fails: nudge on a function this PR made more complex. LOUD when a
+      # touched function CROSSES CCN 30 (hard to test / defect magnet); SOFT one-liner when
+      # one grows >= 5 and ends >= 20. lizard on base-vs-head of the changed .c/.cpp only
+      # (~0.5s/file). bpi leg only; writes ci-out/complexity.md for the stage-2 sticky.
+      if: always() && github.event_name == 'pull_request' && matrix.platform.clang_tidy
+      working-directory: easymesh_project/OneWifi
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+        LIZARD_VERSION: 1.24.0
+      run: |
+        set -uo pipefail
+        mkdir -p ci-out
+        if [ ! -f .github/scripts/complexity_delta.py ]; then
+          exit 0
+        fi
+        # lizard is not on the runner image; install pinned (pure python, ~2-4s). pipx puts
+        # the CLI on PATH, which complexity_delta.py shells out to. Fail-open: if the install
+        # fails the script finds no CCN and writes nothing (never reds the advisory step).
+        pipx install "lizard==${LIZARD_VERSION}" >/dev/null 2>&1 || true
+        : > ci-out/changed-c.txt
+        DIFF_BASE=''
+        if [ -n "$BASE" ]; then
+          git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
+          # Same effective-base logic as the gcc/tidy steps (HEAD^1 on a merge ref).
+          DIFF_BASE="$BASE"
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null \
+             && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
+            DIFF_BASE=HEAD^1
+          fi
+          git diff --name-only --diff-filter=ACM "$DIFF_BASE" HEAD -- '*.c' '*.cpp' '*.cc' \
+            > ci-out/changed-c.txt 2>/dev/null || true
+        fi
+        # BASE=$DIFF_BASE so the script's `git show` reads the same base the file list used.
+        # Writes ci-out/complexity.md only on a finding; always exits 0.
+        BASE="$DIFF_BASE" python3 .github/scripts/complexity_delta.py ci-out/changed-c.txt || true
+        if [ -s ci-out/complexity.md ]; then
+          cat ci-out/complexity.md >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     # ---- Hand-off to the trusted PR-comment stage (pr-comments.yml) ----------
     # Record the PR identity as passive data for the workflow_run poster to
     # validate. Only meaningful on PRs; push builds skip it.

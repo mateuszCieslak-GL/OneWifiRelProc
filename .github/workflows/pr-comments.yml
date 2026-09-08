@@ -368,6 +368,15 @@ jobs:
               echo
               cat "$sc"; echo
             fi
+
+            # --- Complexity (advisory; only when a touched function crossed CCN 30
+            # or grew notably). Same unresolvable, non-duplicating sticky section. ---
+            cx="ci-summary-bpi/complexity.md"
+            if [ -s "$cx" ]; then
+              echo "---"
+              echo
+              cat "$cx"; echo
+            fi
           } > ci-summary-comment.md
           echo "wrote ci-summary-comment.md ($(wc -l < ci-summary-comment.md) lines)"
 
