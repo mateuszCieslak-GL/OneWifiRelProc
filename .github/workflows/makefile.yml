@@ -10,6 +10,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# ── Dependency pins ──────────────────────────────────────────────────────
+# The pin SHAs live in ONE manifest, .github/ci-pins.env, loaded into the job
+# environment by the early "Load dependency pins" step (below) so this workflow
+# and native-build.yml (Coverity) read the same source of truth. To bump a
+# dependency, change the SHA in ci-pins.env AND the matching fallback in setup.sh
+# (the "Verify pin manifest" step enforces the match — a mismatch errors).
+# setup.sh fallbacks keep `make setup` working locally without the workflow;
+# HAL CI clones OneWifi/develop and runs its setup.sh, so those fallbacks are the
+# cross-repo truth. See ci-README.md §7.
+
 # Stage 1 is deliberately read-only: it builds PR-controlled makefiles, so it
 # must hold no write scope. The PR-comment posting (writes) happens only in the
 # trusted workflow_run stage (pr-comments.yml).
@@ -57,15 +67,41 @@ jobs:
         git clone https://github.com/rdkcentral/unified-wifi-mesh.git easymesh_project/unified-wifi-mesh
         mv OneWifi easymesh_project/OneWifi
 
+    - name: Load dependency pins
+      run: |
+        set -uo pipefail
+        # ONE source of truth for every pinned dependency SHA (ci-pins.env),
+        # loaded into $GITHUB_ENV so later steps read $PIN_* exactly as the old
+        # env: block exposed them. native-build.yml loads the same file. The
+        # strict PIN_NAME=<40hex> regex is the gate: a typo'd or truncated pin
+        # must fail here, never load as a silent partial value.
+        manifest=easymesh_project/OneWifi/.github/ci-pins.env
+        [ -f "$manifest" ] || { echo "::error::pin manifest $manifest missing"; exit 1; }
+        pins=$(grep -E '^PIN_[A-Z0-9_]+=[0-9a-f]{40}$' "$manifest" || true)
+        # Real value lines = non-blank, non-comment (unpinned entries are commented
+        # out). Every one of them must be a well-formed pin, else a SHA is malformed.
+        real=$(grep -cE '^[[:space:]]*[^#[:space:]]' "$manifest" || true)
+        matched=$(printf '%s\n' "$pins" | grep -c . || true)
+        if [ -z "$pins" ] || [ "$matched" -ne "$real" ]; then
+          echo "::error::pin manifest $manifest: $matched of $real value line(s) matched PIN_NAME=<40hex> — a pin is malformed or truncated"
+          exit 1
+        fi
+        printf '%s\n' "$pins" >> "$GITHUB_ENV"
+        echo "loaded $matched dependency pin(s) from $manifest"
+
     - name: Set up dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential \
+        # Pruned: removed mariadb-server (100MB, unused — OneWifi doesn't build the
+        # mesh agent that links -lmariadb), golang (runner has Go in toolcache),
+        # libmysqlcppconn-dev (0 includes/linkage), vim (CI doesn't need an editor).
+        # --no-install-recommends avoids pulling unneeded transitive packages.
+        sudo apt-get install -y --no-install-recommends \
+                                build-essential \
                                 cmake \
                                 python3 \
                                 python3-pip \
                                 git \
-                                vim \
                                 libev-dev \
                                 libjansson-dev \
                                 zlib1g-dev \
@@ -77,13 +113,10 @@ jobs:
                                 libprotobuf-c-dev \
                                 libssl-dev \
                                 uuid-dev \
-                                libmysqlcppconn-dev \
                                 libreadline-dev \
                                 iptables \
-                                mariadb-server \
                                 gnupg \
                                 file \
-                                golang \
                                 pkg-config \
                                 libperl-dev \
                                 libjson-c-dev \
@@ -95,88 +128,90 @@ jobs:
         # Steps for ucode installation required for hostapd compilation
         git clone https://github.com/jow-/ucode.git ucode
         cd ucode
-        # Pin ucode: PR#398 (LibFFI module) merged to master 2026-08-27 and broke the bpi
-        # build (ucode's `unused` macro collides with OpenSSL's ossl_unused in HAL TUs).
-        # 655ca6d = a0ca7b1^1 = last master BEFORE the FFI merge = last known-good state
-        # (it is literally what the last green build cloned). The colliding `unused` macro
-        # was added by abb80c6 ON the PR#398 branch, so any commit on that branch -- incl.
-        # 19ffa8a, the earlier (wrong) pin -- still ships the poisoned util.h. Use first-
-        # parent (a0ca7b1^1), NOT plain `git log`, when moving this pin; bump deliberately.
-        git checkout 655ca6d
+        git checkout "$PIN_UCODE"
+        # Assert the tree, not just the SHA: if this pin ever lands on a commit
+        # that defines the `unused` macro, fail here instead of deep in the HAL build.
+        if git grep -q 'define unused' HEAD -- include/; then
+          echo "::error::ucode pin $PIN_UCODE leaks the 'unused' macro (collides with OpenSSL). Check the pin — see the TRAP note in the manifest."
+          exit 1
+        fi
         mkdir build && cd build
         cmake -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF ..
         make -j"$(nproc)"
         sudo make install
         sudo ldconfig
 
-    # Perf: each device leg (bpi, rpi) clones + patches hostap from upstream
-    # (git.w1.fi for rpi, git.w1.fi + GitHub layers for bpi). The patched tree
-    # is a pure function of the pins in setup.sh plus the patch inputs, so
-    # cache it keyed on those files. On a hit, setup.sh's .hostap_patched flag
-    # skips the clone AND patching entirely. A miss falls back to the normal
-    # clone, so this can never be slower than today.
-    #
-    # Exact-key-only (NO restore-keys): a pin bump edits setup.sh -> key
-    # changes -> miss -> full re-clone at new pins. restore-keys would
-    # resurrect a stale patched tree and silently build the wrong hostap.
-    #
-    # Each leg has one UNPINNED patch source whose changes must invalidate
-    # the cache:
-    #   bpi: meta-cmf-bananapi — only the kernel_6_6 patch subdir matters;
-    #        the repo gets daily unrelated commits, so we key on the GitHub
-    #        API tree SHA of that directory (changes only when a patch file
-    #        changes), NOT the whole-repo tip.
-    #   rpi: hostap-patches — the entire repo IS patches, so ls-remote tip
-    #        is appropriate.
-    # mock never clones hostap -> no cache needed.
-    - name: Resolve hostap cache key inputs
+    # Guard: the manifest pins (ci-pins.env, loaded above) MUST match the setup.sh
+    # fallbacks. A mismatch means someone bumped only the manifest → the cache key
+    # (which hashes setup.sh) won't invalidate → CI silently builds the old pinned
+    # tree. HAL CI runs setup.sh directly (no manifest env vars), so fallback drift
+    # also means cross-repo divergence. Fail loud at setup time, not deep in a build.
+    - name: Verify pin manifest matches setup.sh fallbacks
       if: matrix.platform.id != 'mock'
-      id: hostap_key
+      working-directory: easymesh_project/OneWifi
       run: |
+        set -uo pipefail
+        # The pins must have loaded ("Load dependency pins"). An empty value here
+        # means the manifest failed to load — fail before the grep checks below
+        # silently pass on an empty needle. All three pins are named symmetrically
+        # so the SC2153 "possible misspelling" heuristic can't single one out (they
+        # are assigned via $GITHUB_ENV, which the linter cannot see statically).
+        if [ -z "${PIN_HOSTAP_2_11:-}" ] || [ -z "${PIN_HOSTAP_2_10:-}" ] || [ -z "${PIN_META_FILOGIC:-}" ]; then
+          echo "::error::a dependency pin is empty — the pin manifest did not load."
+          exit 1
+        fi
+        ok=true
+        check() { # usage: check ENV_NAME SETUP_FILE
+          local manifest="$1" file="$2" name="$3"
+          if ! grep -qF "$manifest" "$file"; then
+            echo "::error::Pin mismatch: $name manifest='$manifest' not found in $file"
+            ok=false
+          fi
+        }
         if [ "${{ matrix.platform.id }}" = "bpi" ]; then
-          # meta-cmf-bananapi is a large Yocto layer repo that gets daily
-          # commits unrelated to hostap patches. Only one subdirectory
-          # matters: the kernel_6_6 patch dir. Query its git tree SHA via
-          # the GitHub API — it changes only when an actual patch file is
-          # added, removed, renamed, or modified.
-          api_url="https://api.github.com/repos/rdkcentral/meta-cmf-bananapi/contents"
-          api_url="$api_url/meta-rdk-mtk-bpir4/recipes-ccsp/rdk-wifi-libhostap/files/2.11"
-          upstream="$(curl -sfL -H "Authorization: Bearer ${{ github.token }}" "$api_url" \
-            | python3 -c "import sys,json; entries=json.load(sys.stdin); print(next(e['sha'] for e in entries if e['name']=='kernel_6_6'))" 2>/dev/null || true)"
+          check "$PIN_HOSTAP_2_11"  build/linux/bpi/setup.sh PIN_HOSTAP_2_11
+          check "$PIN_META_FILOGIC" build/linux/bpi/setup.sh PIN_META_FILOGIC
         else
-          # hostap-patches repo IS the payload — any commit is a patch change.
-          upstream="$(git ls-remote https://github.com/rdkcentral/hostap-patches.git HEAD | cut -f1)"
+          check "$PIN_HOSTAP_2_10"  build/linux/rpi/setup.sh PIN_HOSTAP_2_10
         fi
-        if [ -z "$upstream" ]; then
-          echo "::warning::Could not resolve upstream patch hash (API/network failure). Cache key falls back to 'unresolved' — a hit may serve a stale tree if patches changed during the outage. Purge with: gh cache delete --all"
+        # native-build.yml (Coverity) must read its hostap pin from the manifest,
+        # never re-hardcode a SHA — a third copy would drift silently. Assert no
+        # bare 40-hex literal has crept back into it.
+        if grep -nE '[0-9a-f]{40}' .github/workflows/native-build.yml; then
+          echo "::error::native-build.yml carries a 40-hex literal — it must load pins from ci-pins.env, not hardcode a SHA."
+          ok=false
         fi
-        echo "upstream=${upstream:-unresolved}" >> "$GITHUB_OUTPUT"
+        $ok || exit 1
 
-        # Hash the setup script + any supplementary patch-list file. rpi's
-        # patches are inline in setup.sh; bpi's are in hostap_patch_list.txt.
-        setup="easymesh_project/OneWifi/build/linux/${{ matrix.platform.id }}/setup.sh"
-        patchlist="easymesh_project/OneWifi/build/openwrt/hostap_patch_list.txt"
-        if [ "${{ matrix.platform.id }}" = "bpi" ]; then
-          hash="$(cat "$setup" "$patchlist" | sha256sum | cut -c1-16)"
-        else
-          hash="$(sha256sum < "$setup" | cut -c1-16)"
-        fi
-        echo "files_hash=$hash" >> "$GITHUB_OUTPUT"
-
-    - name: Cache patched hostap
+    # Perf: each device leg (bpi, rpi) clones + patches hostap from upstream.
+    # The patched tree is a pure function of the pins in setup.sh plus the patch
+    # inputs, so the hostap-tree composite action caches it keyed on those files
+    # (patched-<leg> mode). On a hit, setup.sh's .hostap_patched flag skips the
+    # clone AND patching entirely; a miss falls back to the normal clone, so this
+    # can never be slower than today. The key logic (files hash + the one unpinned
+    # patch source per leg: bpi's meta-cmf-bananapi kernel_6_6 tree SHA, rpi's
+    # hostap-patches tip) lives in the action so Coverity (native-build.yml, plain
+    # mode) shares the same cache machinery. mock never clones hostap.
+    #
+    # NOTE: the local `uses:` path is ./easymesh_project/OneWifi/… NOT ./.github/… —
+    # the checkout lands at OneWifi/ then is mv'd under easymesh_project/OneWifi
+    # (above), so the action only exists at that sub-path (ci-README §10).
+    - name: Provide patched hostap tree (cached)
       if: matrix.platform.id != 'mock'
-      uses: actions/cache@v5
+      uses: ./easymesh_project/OneWifi/.github/actions/hostap-tree
       with:
+        mode: patched-${{ matrix.platform.id }}
         path: easymesh_project/rdk-wifi-libhostap
-        key: hostap-${{ matrix.platform.id }}-${{ steps.hostap_key.outputs.files_hash }}-${{ steps.hostap_key.outputs.upstream }}
+        github-token: ${{ github.token }}
 
     - name: Setup OneWiFi for ${{ matrix.platform.name }}
       working-directory: easymesh_project/OneWifi
       run: |
-        # $GITHUB_ACTOR is a built-in runner env var; use it rather than
-        # interpolating ${{ github.actor }} straight into the script.
-        git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-        git config --global user.name "${GITHUB_ACTOR}"
+        # `make setup` creates local patch commits, so git needs a committer
+        # identity. Use a generic CI identity (not the PR actor) so no personal
+        # name ends up echoed in the build logs.
+        git config --global user.email "onewifi-ci@users.noreply.github.com"
+        git config --global user.name "OneWifi CI"
         make -f ${{ matrix.platform.makefile_path }} setup
 
     - name: Build OneWiFi for ${{ matrix.platform.name }}
@@ -205,7 +240,7 @@ jobs:
         mkdir -p ci-out
         LOG=build.log
         if [ ! -f "$LOG" ]; then
-          echo "## ${{ matrix.platform.name }} — no build log captured" \
+          echo "### ${{ matrix.platform.name }} — no build log captured" \
             | tee ci-out/build-summary.md >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
@@ -213,6 +248,8 @@ jobs:
         errs=$(grep -hE ': (error|fatal error):|undefined reference to|Error [0-9]+' "$LOG" \
                | sed -E 's#[^ ]*/(OneWifi|rdk-wifi-hal|rdk-wifi-libhostap)/#\1/#; s#//#/#g' \
                | sort -u || true)
+        # Persist the normalized error list for the red-build attribution step (5b).
+        printf '%s\n' "$errs" > ci-out/build-errors.txt
         # Surface the top errors as ANNOTATIONS (the box at the top of the failed
         # check, which people actually check) — not only the run-summary page.
         if [ -n "$errs" ]; then
@@ -220,9 +257,9 @@ jobs:
             | while IFS= read -r l; do echo "::error::$l"; done
         fi
         {
-          echo "## ${{ matrix.platform.name }} — build ${{ steps.build.outcome }}"
+          echo "### ${{ matrix.platform.name }} — build ${{ steps.build.outcome }}"
           if [ -n "$errs" ]; then
-            echo "### ❌ Errors ($(printf '%s\n' "$errs" | wc -l) unique)"
+            echo "#### ❌ Errors ($(printf '%s\n' "$errs" | wc -l) unique)"
             echo '```'
             printf '%s\n' "$errs" | head -100
             echo '```'
@@ -231,17 +268,21 @@ jobs:
           # HAL/hostapd/mesh errors still break the build, so will be shown too.
           # OneWifi runs a Yocto-style clean baseline, so anything here
           # is a newly-surfaced bug to triage.
+          # The leading 'easymesh_project/' gate keeps only in-tree sources; without it the
+          # sibling-exclusion below would still admit system/toolchain warnings (/usr/include,
+          # /usr/lib/gcc). Mirrors rdk-wifi-hal's makefile.yml so the two stay in sync.
           warns=$(grep -hE ': warning:' "$LOG" \
-                  | grep -vE 'rdk-wifi-hal|rdk-wifi-libhostap|unified-wifi-mesh' \
+                  | grep -E 'easymesh_project/' \
+                  | grep -vE 'rdk-wifi-hal|rdk-wifi-libhostap|unified-wifi-mesh|halinterface|trower-base64' \
                   | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' \
                   | sort -u || true)
           if [ -n "$warns" ]; then
-            echo "### ⚠️ OneWifi warnings ($(printf '%s\n' "$warns" | wc -l))"
+            echo "#### ⚠️ OneWifi warnings ($(printf '%s\n' "$warns" | wc -l))"
             echo '```'
             printf '%s\n' "$warns" | head -100
             echo '```'
           else
-            echo "### ⚠️ OneWifi warnings: 0"
+            echo "#### ⚠️ OneWifi warnings: 0"
           fi
         } | tee ci-out/build-summary.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -249,42 +290,116 @@ jobs:
       if: always() && matrix.platform.clang_tidy
       working-directory: easymesh_project/OneWifi
       run: |
-        # Two-tier clang-tidy over PR-changed .c/.cpp files (see .clang-tidy):
-        #   * WarningsAsErrors checks    -> `error:`   -> FATAL (this step fails the job)
-        #   * rest of enabled bugprone-* -> `warning:` -> advisory only
-        # clang-diagnostic-* (most false positives and most noisy) is filtered out so it can NEVER
-        # gate. The gate is changed-files-only: a PR can only fail on a .c/.cpp it touched.
+        # Three-tier clang-tidy over PR-changed .c/.cpp files (see .clang-tidy + EXTRA_CHECKS below):
+        #   * WarningsAsErrors checks       -> `error:`   -> FATAL (this step fails the job)
+        #   * advisory bugprone-*           -> `warning:` -> advisory (also inline)
+        #   * clang-analyzer-* / unreachable -> `warning:` -> INFORMATIONAL (summary-only, never
+        #                                       gates, never inline; path-sensitive so it flickers)
+        # clang-diagnostic-* is filtered out (clang-vs-gcc parse errors, unbuilt-file noise) EXCEPT
+        # the armed unreachable-code group, which the allow-list keeps as the dead-code proxy; it
+        # can never gate (it prints `warning:`, not `error:`). The gate is changed-LINES-scoped: a PR
+        # can only fail on a .c/.cpp LINE it touched, so pre-existing findings on untouched lines never red it.
         mkdir -p ci-out
-        [ -f compile_commands.json ] || { echo "### 🔎 clang-tidy: no compile DB" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+        if [ ! -f compile_commands.json ]; then
+          echo "#### 🔎 clang-tidy: no compile DB" >> "$GITHUB_STEP_SUMMARY"
+          # skipped (not clean) so the stage-2 poster leaves inline comments alone.
+          printf '%s' '{"source":"clang-tidy","status":"skipped","dropped":0,"comments":[]}' > ci-out/inline-tidy.json
+          exit 0
+        fi
         BASE='${{ github.event.pull_request.base.sha }}'
         CHANGED=''
+        DIFF_BASE="$BASE"
         if [ -n "$BASE" ]; then
           git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
-          # Changed file not present in compile_commands.json (not built) falls back to default
-          # flags. A real source then can't resolve its includes -> a fatal clang-diagnostic
-          # aborts file parsing before any check run on it -> that output is dropped by the
-          # clang-diagnostic filter below -> file can't fail. Thus, only built files are judged.
+          # Diff against the merge ref's real base parent (HEAD^1), not the frozen payload
+          # BASE: this step's checkout has no `ref:`, so HEAD is refs/pull/N/merge and HEAD^1
+          # is the CURRENT base. On a RE-RUN of an old run the merge ref re-resolves to today's
+          # base while $BASE stays pinned, so a two-dot $BASE..HEAD would blame post-fork
+          # base-branch changes on the PR (gate/line-scope fires on lines the author never
+          # touched). Use HEAD^1 when HEAD is a merge commit AND $BASE is its ancestor (the
+          # is-ancestor probe makes the parent-order assumption self-verifying); else keep
+          # $BASE. Mirrors gcc_diff_gate.py effective_base().
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null \
+             && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
+            DIFF_BASE=HEAD^1
+          fi
+          # Changed file not present in compile_commands.json (not built) is skipped explicitly by
+          # the per-file DB-presence guard in the loop below (it used to self-skip via the blanket
+          # clang-diagnostic filter, but the allow-list now keeps unreachable-code, so an unbuilt
+          # file's misparse could otherwise leak an FP). Only built files are judged either way.
           # Exclude only the vendored hostap tree (sibling clone rdk-wifi-libhostap/), never
           # first-party sources: '^build/' wrongly dropped build/linux/compat/coverage_stubs.c
           # (compiled by the makefile, real DB entry) and bare 'hostap' dropped e.g.
-          # wifi_hostapd_glue.c. A changed file not in the DB self-skips (default-flags fallback
-          # -> fatal clang-diagnostic -> filtered below), so DB membership is the real gate.
+          # wifi_hostapd_glue.c. DB membership (checked in the loop) is the real gate.
           # Anchored '^': git diff paths are repo-relative and the vendored tree, if ever
           # surfaced, sits at the repo root -- so a first-party path that merely *contains*
           # the name (e.g. source/.../rdk-wifi-libhostap-notes.c) is never dropped.
-          CHANGED=$(git diff --name-only --diff-filter=ACM "$BASE" HEAD -- '*.c' '*.cpp' 2>/dev/null \
+          CHANGED=$(git diff --name-only --diff-filter=ACM "$DIFF_BASE" HEAD -- '*.c' '*.cpp' 2>/dev/null \
                     | grep -vE '^rdk-wifi-libhostap/' || true)
         fi
+        # Extra checks this repo wants on top of the shared .clang-tidy config.
+        # --warnings-as-errors COMBINES with the config's WAE (proven clang-tidy-18);
+        # --checks APPENDS to the config's Checks. Both auto-inherit changed-lines
+        # scope because the awk filter below runs on output, not input.
+        # See clang-tidy-hal-extra-mechanism memory for the proof + HAL usage.
+        EXTRA_WAE=''       # comma-separated bugprone checks to gate (empty = baseline only)
+        # Informational (advisory-only) additions. All three are path-sensitive or a
+        # dead-code proxy -> summary-only, NEVER gated, and excluded from inline by
+        # tidy_to_inline.py (they flicker with analyzer version / inlining). Split out of
+        # the advisory bucket below by tag.
+        #   clang-analyzer-core.*/unix.*  path-sensitive symbolic execution (null deref,
+        #                                 malloc misuse); needs the parse-unblock below.
+        #   clang-analyzer-deadcode.DeadStores  dead STORES (value set, never read).
+        #   clang-diagnostic-unreachable-code*  unreachable STATEMENTS (the dead-code proxy
+        #                                 the plain filter used to drop; armed below).
+        EXTRA_CHECKS='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-deadcode.DeadStores,clang-diagnostic-unreachable-code*'
+        extra=()
+        [ -n "$EXTRA_WAE" ]    && extra+=(--warnings-as-errors="$EXTRA_WAE")
+        [ -n "$EXTRA_CHECKS" ] && extra+=(--checks="$EXTRA_CHECKS")
+        # clang-analyzer parse-unblock (same as the HAL): the DB promotes clang's
+        # const-discard assignments to errors via -Werror=incompatible-pointer-types,
+        # which makes the analyzer engine bail on the file ("Error while processing") with
+        # 0 findings -> demote just that one diagnostic. Harmless when no analyzer check runs.
+        extra+=( '--extra-arg=-Wno-error=incompatible-pointer-types-discards-qualifiers' )
+        # Arm -Wunreachable-code so clang-diagnostic-unreachable-code* has something to
+        # report (clang emits nothing for the group unless the warning is on). -aggressive
+        # widens it to returns/loops; still advisory, so its FPs never gate.
+        extra+=( '--extra-arg=-Wunreachable-code' '--extra-arg=-Wunreachable-code-aggressive' )
         : > tidy.log
         for f in $CHANGED; do
           [ -f "$f" ] || continue
+          # DB-presence guard: the allow-list below now KEEPS clang-diagnostic-unreachable-code
+          # (it used to drop every clang-diagnostic). A changed file absent from the compile DB
+          # runs with default flags, misparses, and could then leak an unreachable-code FP, so
+          # skip it here (it used to self-skip via the blanket clang-diagnostic filter). DB paths
+          # are absolute and end in the repo-relative path; paths are assumed quote-free (as
+          # elsewhere in this step -- `for f in $CHANGED` is itself unquoted).
+          grep -qF "/$f\"" compile_commands.json || continue
+          # new-side line numbers this PR changed in *this* file (zero-context hunks)
+          lines=$(git diff -U0 --diff-filter=ACM "$DIFF_BASE" HEAD -- "$f" 2>/dev/null \
+                  | awk '/^@@ /{c=$3;sub(/^\+/,"",c);n=1;if(c~/,/){split(c,a,",");c=a[1];n=a[2]}
+                         for(i=0;i<n;i++)if(n>0)print c+i}' | sort -un | paste -sd' ' -)
+          [ -n "$lines" ] || continue
           # || true: a no-match grep (exit 1) or a clang-tidy hiccup must not abort the loop.
-          clang-tidy-18 -p . --quiet "$f" 2>/dev/null \
-            | grep -E ': (warning|error):' | grep -v clang-diagnostic >> tidy.log || true
+          # clang-tidy runs one file at a time -> every finding is this file's, so keep only the
+          # ones whose LINE the PR changed. Filter on the line number alone: matching the
+          # sed-normalized display path against git-diff paths is fragile (silently drops all).
+          # Allow-list filter (was `grep -v clang-diagnostic`): still drop every clang-diagnostic
+          # (clang-vs-gcc parse errors, unbuilt-file include floods) EXCEPT the armed
+          # unreachable-code group, so the dead-code proxy survives while the noise stays out.
+          clang-tidy-18 -p . "${extra[@]}" --quiet "$f" 2>/dev/null \
+            | grep -E ': (warning|error):' \
+            | awk '!/clang-diagnostic/ || /clang-diagnostic-unreachable-code/' \
+            | awk -F: -v L="$lines" 'BEGIN{split(L,a," ");for(i in a)k[a[i]]} ($2 in k)' >> tidy.log || true
         done
         # WarningsAsErrors-promoted checks print as `error:`; everything else as `warning:`.
-        gated=$(grep -E ': error:'   tidy.log | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' | sort -u || true)
-        advis=$(grep -E ': warning:' tidy.log | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' | sort -u || true)
+        # Three buckets. error: -> gated (the .clang-tidy WarningsAsErrors set). warning: is
+        # split by tag: clang-analyzer-* / clang-diagnostic-unreachable-code -> INFORMATIONAL
+        # (path-sensitive; summary-only, never inline, never gated); everything else -> advisory.
+        _norm='s#[^ ]*/OneWifi/+##; s#//#/#g'
+        gated=$(grep -E ': error:'   tidy.log | sed -E "$_norm" | sort -u || true)
+        info=$(grep  -E ': warning:' tidy.log | grep -E  '\[(clang-analyzer-|clang-diagnostic-unreachable-code)' | sed -E "$_norm" | sort -u || true)
+        advis=$(grep -E ': warning:' tidy.log | grep -vE '\[(clang-analyzer-|clang-diagnostic-unreachable-code)' | sed -E "$_norm" | sort -u || true)
         if [ -n "$gated" ]; then
           printf '%s\n' "$gated" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
             | while IFS= read -r l; do echo "::error::$l"; done
@@ -293,24 +408,42 @@ jobs:
           printf '%s\n' "$advis" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
             | while IFS= read -r l; do echo "::warning::$l"; done
         fi
+        # Informational findings as annotations too: unresolvable, land in the Files tab,
+        # and add no resolvable review-thread clutter. Per-run, so analyzer flicker is harmless.
+        if [ -n "$info" ]; then
+          printf '%s\n' "$info" | head -10 | sed 's/%/%25/g; s/\r/%0D/g' \
+            | while IFS= read -r l; do echo "::warning::$l"; done
+        fi
         {
-          if   [ -z "$CHANGED" ];     then echo "### 🔎 clang-tidy: no changed .c to scan"
-          elif [ -z "$gated$advis" ]; then echo "### 🔎 clang-tidy: clean on changed files"
+          if   [ -z "$CHANGED" ];          then echo "#### 🔎 clang-tidy: no changed .c/.cpp to scan"
+          elif [ -z "$gated$advis$info" ]; then echo "#### 🔎 clang-tidy: clean on changed lines"
           else
             if [ -n "$gated" ]; then
-              echo "### ❌ clang-tidy gate — $(printf '%s\n' "$gated" | wc -l) fatal"
+              echo "#### ❌ clang-tidy gate — $(printf '%s\n' "$gated" | wc -l) fatal"
               echo '```'; printf '%s\n' "$gated" | head -100; echo '```'
               echo "_Fix the finding, or if it is a deliberate, waive it inline with \`// NOLINT(<check-name>)\` on that line._"
             fi
             if [ -n "$advis" ]; then
-              echo "### 🔎 clang-tidy advisory — $(printf '%s\n' "$advis" | wc -l) findings"
+              echo "#### 🔎 clang-tidy advisory — $(printf '%s\n' "$advis" | wc -l) findings"
               echo '```'; printf '%s\n' "$advis" | head -100; echo '```'
+            fi
+            if [ -n "$info" ]; then
+              echo "#### 🔬 clang-analyzer / dead-code (informational) — $(printf '%s\n' "$info" | wc -l)"
+              echo "_Path-sensitive; advisory only, never gates or posts inline. Review in the Files tab._"
+              echo '<details><summary>show findings</summary>'; echo
+              echo '```'; printf '%s\n' "$info" | head -20; echo '```'
+              echo '</details>'
             fi
           fi
         } | tee ci-out/tidy-summary.md >> "$GITHUB_STEP_SUMMARY"
+        # Inline-review candidates (Commit 5): parse tidy.log (already changed-lines
+        # scoped) into per-finding comments for the stage-2 'inline' job. Written
+        # even when the gate fires below — findings post regardless of pass/fail.
+        # Never reds the step (|| true): a parse hiccup must not fail the build.
+        python3 .github/scripts/tidy_to_inline.py tidy.log ci-out/inline-tidy.json || true
         # Gate AFTER the summary + artifact are written, on promoted checks only.
         if [ -n "$gated" ]; then
-          echo "clang-tidy gate: $(printf '%s\n' "$gated" | wc -l) promoted-check violation(s) on changed files" >&2
+          echo "clang-tidy gate: $(printf '%s\n' "$gated" | wc -l) promoted-check violation(s) on changed lines" >&2
           exit 1
         fi
 
@@ -333,24 +466,51 @@ jobs:
         #      with NO "mechanism error" summary line (the try/except fail-open);
         #   2. >= 1 advisory finding (the -Wunused-* classes fire on ordinary
         #      refactors) hand-checked against the diff -> line attribution correct;
-        #   3. zero false positives on the GATE classes.
+        #   3. zero false positives on the GATE classes;
+        #   4. the tree-occurrence count of each GATE class is measured and known --
+        #      several (int-conversion, incompatible-pointer-types, ...) are suppressed
+        #      by ONE_WIFI_WARN and so carry a backlog; because the gate is line-scoped,
+        #      a PR that edits an existing-violation line for an unrelated reason gates
+        #      on it, so the backlog size must be a known, accepted number first.
         # Gate on that evidence, not the calendar. Silence of the GATE classes alone
         # proves nothing (they're rarely introduced) -- the advisory classes are what
         # exercise the recompile + line-scoping machinery.
         ENFORCE: 'false'
+        # Optimization level for the recompile ONLY (not the build product): production
+        # bpi/rpi are -Os but the compile DB is -O0, so middle-end warnings are dormant.
+        # -Os wakes them on the changed files at production's level. The script strips the
+        # DB's own -Werror=<class> promotions (incl. -Werror=array-bounds/-maybe-uninitialized
+        # that -Os trips) so no class can abort the analysis; a real error still exits nonzero.
+        OPT: '-Os'
         # GATE = fail the job (when ENFORCE=true) if introduced on a changed line.
-        # ADVISORY = report only. -Wvla (stack-overflow) + -Wreturn-type (UB) are
-        # high-impact + reliable -> first to gate. The dead-code family is
-        # diff-scope-reliable but kept ADVISORY (promote a class into GATE_WARNINGS
-        # once quiet on real PRs). (-Wunreachable-code-* are clang-only; the "moved
-        # code left set-but-unused vars" case is -Wunused-but-set-variable.)
-        GATE_WARNINGS: "-Wvla -Wreturn-type"
-        ADVISORY_WARNINGS: "-Wunused-but-set-variable -Wunused-value -Wunused-label"
+        # ADVISORY = report only (and inline; GATE findings are summary-only).
+        # GATE picks: front-end, ~0-FP, crash/RCE/UB or next-compiler-break classes.
+        #   -Wvla (stack overflow), -Wreturn-type (UB). -Wint-conversion,
+        #   -Wimplicit-function-declaration, -Wimplicit-int, -Wincompatible-pointer-types
+        #   are ERRORS-BY-DEFAULT in gcc-14 regardless of -std, so gating on changed
+        #   lines stops the backlog growing before the runner bumps to gcc-14 and the
+        #   tree stops building. -Wsizeof-pointer-memaccess (truncated mem*/str* copy),
+        #   -Wformat-security (uncontrolled format -> leak / %n write; armed by the DB's
+        #   -Wall). The four C-only classes are auto-dropped on C++ TUs by the script.
+        GATE_WARNINGS: "-Wvla -Wreturn-type -Wint-conversion -Wimplicit-function-declaration -Wimplicit-int -Wincompatible-pointer-types -Wsizeof-pointer-memaccess -Wformat-security"
+        # ADVISORY: measured quiet over the compile DB at -Os (each 0-4 findings tree-wide,
+        # so they only fire on something genuinely new). -Wpointer-sign (33) and
+        # -Wdiscarded-qualifiers (14) were DROPPED as too noisy. Middle-end classes need
+        # the -Os above to fire.
+        ADVISORY_WARNINGS: "-Wunused-function -Wunused-but-set-variable -Wunused-variable -Wunused-value -Wunused-label -Waddress -Wstringop-overflow -Wstringop-overread -Warray-bounds -Wdangling-pointer -Wuse-after-free"
+        # Inline-review candidates (Commit 5) for the stage-2 'inline' job. Lands in
+        # ci-out/ (uploaded as ci-summary-bpi). Absent/unset -> the script writes none.
+        INLINE_JSON: "ci-out/inline-gcc.json"
+        # Second, time-boxed gcc -fanalyzer pass per changed file: null-deref/leak/OOB via
+        # symbolic execution. Informational only (summary-only, never gates, never inline --
+        # path-sensitive, flickers with gcc version). Changed-lines-scoped, so a PR pays only
+        # for its files (~0.25s median, worst ~16s on a giant file, capped by ANALYZER_TIMEOUT).
+        ANALYZER: 'true'
       run: |
         set -uo pipefail
         mkdir -p ci-out
         if [ ! -f compile_commands.json ] || [ -z "$BASE" ]; then
-          echo "### 🚦 gcc diff-gate: no compile DB or PR base — skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### 🚦 gcc diff-gate: no compile DB or PR base — skipped" >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
@@ -359,7 +519,7 @@ jobs:
         # A missing script (partial cherry-pick / not yet on this branch) must skip,
         # not red the job: python3 on an absent file exits 2 and would fail the matrix.
         if [ ! -f .github/scripts/gcc_diff_gate.py ]; then
-          echo "### 🚦 gcc diff-gate: script not present — skipped" | tee -a ci-out/gcc-gate-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "#### 🚦 gcc diff-gate: script not present — skipped" | tee -a ci-out/gcc-gate-summary.md >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         set +e
@@ -368,6 +528,108 @@ jobs:
         set -e
         tee -a ci-out/gcc-gate-summary.md < gcc-gate.md >> "$GITHUB_STEP_SUMMARY"
         exit "$rc"
+
+    # Red-build attribution (Commit 5b): only when THIS leg's build step failed.
+    # Placed LAST among the analysis steps — it reversibly reverts the PR to test
+    # whether the failing TUs compile on base sources, so it must run after
+    # clang-tidy + the gcc gate (which need the pristine PR tree). Advisory and
+    # fail-open: the script always exits 0 and always restores the tree. Tier 2
+    # (the definitive revert-and-recompile verdict) runs only where a compile DB
+    # exists (HAVE_DB, i.e. the bpi leg); other legs emit the tier-1 heuristic.
+    - name: Red-build attribution for ${{ matrix.platform.name }}
+      if: always() && steps.build.outcome == 'failure' && github.event_name == 'pull_request' && matrix.platform.id != 'mock'
+      working-directory: easymesh_project/OneWifi
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+        # 'true' only on a leg that built compile_commands.json (bpi runs bear).
+        # Gate tier 2 on this, NEVER on a bare file check: a stale DB on a DB-less
+        # leg would recompile with the wrong flags and produce a confident wrong verdict.
+        HAVE_DB: ${{ matrix.platform.clang_tidy && 'true' || '' }}
+      run: |
+        set -uo pipefail
+        mkdir -p ci-out
+        # A missing script (partial cherry-pick) must skip, not red the matrix.
+        if [ ! -f .github/scripts/build_attribution.py ]; then
+          echo "#### 🧭 red-build attribution: script not present — skipped" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
+        # The script is fail-open (always exits 0); || true guards a python launch failure.
+        python3 .github/scripts/build_attribution.py >> "$GITHUB_STEP_SUMMARY" || true
+
+    - name: Source-coverage nudge for ${{ matrix.platform.name }}
+      # Advisory, NEVER fails the build: flag a source file this PR ADDS that a
+      # Makefile.am lists but neither leg compiles — a likely-forgotten build
+      # makefile entry. Runs on the bpi leg only (its checkout carries both legs'
+      # makefiles); writes ci-out/source-coverage.md into the artifact for the
+      # trusted stage-2 job to fold into the one ci-summary sticky.
+      if: always() && github.event_name == 'pull_request' && matrix.platform.clang_tidy
+      working-directory: easymesh_project/OneWifi
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -uo pipefail
+        mkdir -p ci-out
+        if [ ! -f .github/scripts/source_coverage.py ]; then
+          exit 0
+        fi
+        : > ci-out/added-sources.txt
+        if [ -n "$BASE" ]; then
+          git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
+          # Same effective-base logic as the gcc/tidy steps (HEAD^1 on a merge ref).
+          DIFF_BASE="$BASE"
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null \
+             && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
+            DIFF_BASE=HEAD^1
+          fi
+          git diff --name-only --diff-filter=A "$DIFF_BASE" HEAD -- '*.c' '*.cpp' '*.cc' \
+            > ci-out/added-sources.txt 2>/dev/null || true
+        fi
+        # Writes ci-out/source-coverage.md only on a finding; always exits 0.
+        python3 .github/scripts/source_coverage.py ci-out/added-sources.txt || true
+        if [ -s ci-out/source-coverage.md ]; then
+          cat ci-out/source-coverage.md >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Complexity delta for ${{ matrix.platform.name }}
+      # Advisory, NEVER fails: nudge on a function this PR made more complex. LOUD when a
+      # touched function CROSSES CCN 30 (hard to test / defect magnet); SOFT one-liner when
+      # one grows >= 5 and ends >= 20. lizard on base-vs-head of the changed .c/.cpp only
+      # (~0.5s/file). bpi leg only; writes ci-out/complexity.md for the stage-2 sticky.
+      if: always() && github.event_name == 'pull_request' && matrix.platform.clang_tidy
+      working-directory: easymesh_project/OneWifi
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+        LIZARD_VERSION: 1.24.0
+      run: |
+        set -uo pipefail
+        mkdir -p ci-out
+        if [ ! -f .github/scripts/complexity_delta.py ]; then
+          exit 0
+        fi
+        # lizard is not on the runner image; install pinned (pure python, ~2-4s). pipx puts
+        # the CLI on PATH, which complexity_delta.py shells out to. Fail-open: if the install
+        # fails the script finds no CCN and writes nothing (never reds the advisory step).
+        pipx install "lizard==${LIZARD_VERSION}" >/dev/null 2>&1 || true
+        : > ci-out/changed-c.txt
+        DIFF_BASE=''
+        if [ -n "$BASE" ]; then
+          git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
+          # Same effective-base logic as the gcc/tidy steps (HEAD^1 on a merge ref).
+          DIFF_BASE="$BASE"
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null \
+             && git merge-base --is-ancestor "$BASE" HEAD^1 2>/dev/null; then
+            DIFF_BASE=HEAD^1
+          fi
+          git diff --name-only --diff-filter=ACM "$DIFF_BASE" HEAD -- '*.c' '*.cpp' '*.cc' \
+            > ci-out/changed-c.txt 2>/dev/null || true
+        fi
+        # BASE=$DIFF_BASE so the script's `git show` reads the same base the file list used.
+        # Writes ci-out/complexity.md only on a finding; always exits 0.
+        BASE="$DIFF_BASE" python3 .github/scripts/complexity_delta.py ci-out/changed-c.txt || true
+        if [ -s ci-out/complexity.md ]; then
+          cat ci-out/complexity.md >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     # ---- Hand-off to the trusted PR-comment stage (pr-comments.yml) ----------
     # Record the PR identity as passive data for the workflow_run poster to

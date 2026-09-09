@@ -23,7 +23,8 @@ Gate not-yet-promoted gcc warning classes on the PR's changed lines *only*, with
 promoting them tree-wide. The OneWifi tree still carries backlogs for these classes
 (e.g. -Wvla: 18 sites, -Wreturn-type: 11), so a whole-file/tree -Werror would red every
 PR. Instead lets recompile each changed .c/.cpp from compile_commands.json with the candidate
-warnings enabled, then keep only findings whose line the PR actually changed.
+warnings enabled (non-fatal: the DB's own -Werror=<class> promotions are stripped and -Os is
+applied when OPT is set — see recompile_cmd), then keep only findings whose line the PR changed.
 A PR can then fail on a class that fires on a line it changed. NB this is
 line-scoped, not base-compared: a warning already present on a line the PR
 edits for an unrelated reason also counts (accepted trade-off, not literally
@@ -40,10 +41,20 @@ Env:
   GATE_WARNINGS      space-separated -W flags that FAIL the job when introduced on a changed line
   ADVISORY_WARNINGS  space-separated -W flags that are only reported
   ENFORCE            'false' -> advisory (render ❌ but exit 0). default enforce
+  OPT                optimization level for the recompile only (e.g. '-Os' to match
+                     production and wake middle-end warnings). Empty -> keep the DB's -O.
+  ANALYZER           truthy ('1'/'true'/...) -> also run a time-boxed gcc -fanalyzer pass
+                     per changed file (informational: summary-only, never gates/inlines).
+  ANALYZER_TIMEOUT   per-file -fanalyzer wall-clock cap in seconds (default 90).
   REPO_DIR           dir the changed files + git history live in (default '.'; the HAL sets
                      this to '../rdk-wifi-hal' since its DB lives in the cloned OneWifi cwd)
+  INLINE_JSON        optional path; when set, also write a review_poster.py candidate
+                     envelope (source 'gcc-gate') of the ADVISORY findings so they can be
+                     posted as inline PR review comments (Commit 5). GATED findings are
+                     summary-only, never inline. Empty/unset -> no file.
 Exit: 1 iff a GATE class fired on a changed line (and ENFORCE); else 0. Always writes a
-markdown summary to stdout. Identical file ships in OneWifi and the HAL.
+markdown summary to stdout. Identical file ships in OneWifi and the HAL — the INLINE_JSON
+support must be re-ported verbatim when this file is synced to the HAL.
 """
 import json
 import os
@@ -63,15 +74,144 @@ ENFORCE = os.environ.get("ENFORCE", "true").strip().lower() not in ("false", "0"
 # '../rdk-wifi-hal' for the HAL (its DB is built in the cloned OneWifi cwd, cross-dir).
 REPO_DIR = os.environ.get("REPO_DIR", ".").strip() or "."
 DB = "compile_commands.json"
+# Optimization level for the RECOMPILE ONLY (not the real build). Production bpi/rpi
+# compile at -Os, but CI's compile DB is -O0, so every middle-end (post-optimization)
+# warning is dormant: -Wstringop-*, -Warray-bounds, -Wmaybe-uninitialized, -Wdangling-
+# pointer, -Wuse-after-free. Setting OPT=-Os in the workflow wakes them on the changed
+# files at production's exact level, without touching the build product or the silent
+# baseline the build-summary relies on. Empty (the default) keeps the DB's own -O.
+OPT = os.environ.get("OPT", "").strip()
+# When set, write inline-review candidates here (Commit 5). Same envelope
+# review_poster.py reads; source 'gcc-gate' gives it top posting priority.
+INLINE_JSON = os.environ.get("INLINE_JSON", "").strip()
 
 # Map each candidate -Wflag to its [-Wflag] diagnostic tag; classify a warning line by tag.
 GATE_TAGS = {f"[{w}]" for w in GATE}
 ADVISORY_TAGS = {f"[{w}]" for w in ADVISORY}
 ALL_FLAGS = GATE + ADVISORY
-# Demote every candidate to a warning so the recompile never errors out mid-file.
-NO_ERROR = [f"-Wno-error={w[2:]}" for w in ALL_FLAGS]
-LINE_RE = re.compile(r"\.(?:c|cpp):(\d+):")
+# C++ TU extensions. gcc rejects a few -W flags for C++ ("valid for C/ObjC but not for
+# C++") — harmless (g++ warns and continues, exit 0) but noisy; drop them on C++ TUs.
+CXX_EXT = (".cpp", ".cc", ".cxx")
+# Flags gcc accepts for C only. Kept explicit (not probed) so a reader sees which
+# classes protect C sources; verified on gcc 13.3.0.
+C_ONLY = {
+    "-Wint-conversion", "-Wimplicit-function-declaration", "-Wimplicit-int",
+    "-Wincompatible-pointer-types", "-Wpointer-sign", "-Wdiscarded-qualifiers",
+    "-Wjump-misses-init",
+}
+LINE_RE = re.compile(r"\.(?:c|cc|cpp|cxx):(\d+):")
 TAG_RE = re.compile(r"\[-W[a-z0-9-]+\]")
+# -fanalyzer informational pass (Commit 3): a SEPARATE recompile with gcc's symbolic
+# execution engine. Summary-only -- never gates, never inline (path-sensitive: findings
+# flicker with gcc version / inlining). Enabled by ANALYZER; time-boxed per file since the
+# engine can be slow on huge files (nl80211.c ~16s). Findings tag [-Wanalyzer-*].
+ANALYZER = os.environ.get("ANALYZER", "").strip().lower() in ("1", "true", "yes", "on")
+ANALYZER_FLAGS = ["-fanalyzer", "-fanalyzer-verbosity=1"]
+try:
+    ANALYZER_TIMEOUT = int(os.environ.get("ANALYZER_TIMEOUT", "90") or "90")
+except ValueError:
+    ANALYZER_TIMEOUT = 90
+ANALYZER_TAG_RE = re.compile(r"\[-Wanalyzer-[a-z0-9-]+\]")
+# Parse a normalized `disp` line (path already stripped) into inline-comment fields.
+INLINE_RE = re.compile(r"^(?P<path>[^:]+):(?P<line>\d+):\d+: warning: (?P<msg>.*) \[(?P<tag>-W[a-z0-9-]+)\]$")
+
+
+def write_inline(status, comments, dropped=0):
+    """Write the review_poster.py candidate envelope to INLINE_JSON (no-op if unset).
+
+    status 'skipped' (no DB/BASE, or a mechanism error) writes an empty comment
+    list, which the poster reads as "producer failed" and so disables stale-comment
+    deletion for the slot — never as "all clean, delete everything" (fail-open).
+    A never-raising best-effort write: a failure here must not red the gate.
+    """
+    if not INLINE_JSON:
+        return
+    try:
+        d = os.path.dirname(INLINE_JSON)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(INLINE_JSON, "w") as fh:
+            json.dump({"source": "gcc-gate", "status": status,
+                       "dropped": dropped, "comments": comments}, fh)
+    except Exception as exc:  # pragma: no cover - best-effort I/O
+        print(f"::warning::gcc diff-gate could not write INLINE_JSON {INLINE_JSON}: {exc}",
+              file=sys.stderr)
+
+
+def build_inline(advis):
+    """Turn the deduped ADVISORY display lines into inline candidates.
+
+    GATED findings are NOT inlined — they go to the summary only: the gate's ❌ block
+    already prints file:line, the red check (not a resolvable comment) is the
+    enforcement, and an author-resolvable comment on an enforced finding only invites
+    "clicked resolve, nothing happened" confusion. Inline is for the low-stakes
+    advisory that an author may reasonably clear.
+
+    One comment per (path, line, tag, msg): gcc repeats a finding at several
+    columns on macro expansion, so dedupe on those four fields (dropping the
+    column) — review_poster does NOT dedupe candidates against each other, so a
+    duplicate here would post a duplicate comment. A line that does not parse is
+    counted as 'dropped' (surfaced in the poster's summary), never silently lost.
+    """
+    inline, seen, dropped = [], set(), 0
+    for d in advis:
+        m = INLINE_RE.match(d)
+        if not m:
+            dropped += 1
+            continue
+        key = (m["path"], int(m["line"]), m["tag"], m["msg"])
+        if key in seen:
+            continue
+        seen.add(key)
+        inline.append({
+            "path": m["path"],
+            "line": int(m["line"]),
+            "side": "RIGHT",
+            "body": f"🚦 **gcc** `{m['tag']}` (advisory) — {m['msg']}",
+        })
+    return inline, dropped
+
+
+def recompile_cmd(args, path):
+    """The per-file recompile command for one changed TU.
+
+    `args` is the DB command already minus -c/-o (from db_args). This recompile only
+    COLLECTS warnings, so no diagnostic may abort it. Two mechanisms are needed:
+
+      * STRIP every -Werror* token from args. The DB carries 13 distinct -Werror=<class>
+        promotions (incl. -Werror=maybe-uninitialized / -array-bounds that -Os newly
+        trips). A bare -Wno-error does NOT undo a per-class -Werror=<class> (verified
+        gcc 13.3.0: `-Werror=return-type -Wno-error` still errors), so drop them outright.
+      * KEEP a per-class -Wno-error=<class> for every candidate. On gcc-14 the classes
+        int-conversion / implicit-function-declaration / implicit-int /
+        incompatible-pointer-types are errors BY DEFAULT (no -Werror= involved), so the
+        strip above does not cover them — the explicit -Wno-error= does.
+
+    A genuine error (missing header, killed compiler) is not a -Werror promotion and
+    still exits nonzero -> the caller's failed[] path. -Os is added when OPT is set;
+    the C-only flags are dropped for C++ TUs (g++ rejects them).
+    """
+    is_cxx = path.endswith(CXX_EXT)
+    flags = [w for w in ALL_FLAGS if not (is_cxx and w in C_ONLY)]
+    no_error = [f"-Wno-error={w[2:]}" for w in flags]
+    opt = [OPT] if OPT else []
+    kept = [a for a in args if not a.startswith("-Werror")]
+    return kept + opt + ["-c", "-o", os.devnull] + flags + no_error
+
+
+def analyzer_cmd(args, path):
+    """The per-file command for the -fanalyzer informational pass (Commit 3).
+
+    Kept SEPARATE from recompile_cmd: -Wanalyzer-* findings are their own group (no
+    candidate -W flags needed) and the pass is time-boxed by the caller. As in
+    recompile_cmd, every -Werror promotion is stripped and a bare -Wno-error added so no
+    class can abort it; -Os is applied when OPT is set (analyzer results are opt-sensitive,
+    so match the warning pass). gcc 13's -fanalyzer runs on C++ TUs too (verified on
+    matrix.cpp: no 'experimental' noise, real findings), so no per-language gating; `path`
+    is unused today but kept for symmetry / future per-language tuning."""
+    kept = [a for a in args if not a.startswith("-Werror")]
+    opt = [OPT] if OPT else []
+    return kept + opt + ANALYZER_FLAGS + ["-Wno-error", "-c", "-o", os.devnull]
 
 
 def effective_base():
@@ -143,17 +283,26 @@ def changed_files(base):
 
 
 def changed_lines(base, f):
-    """New-side line numbers this PR changed in f (zero-context hunks)."""
+    """New-side line ranges this PR changed in f (zero-context hunks).
+
+    Returns a list of (start, end) inclusive intervals instead of a per-line
+    set, so memory is bounded by hunk count, not total changed-line count.
+    """
     diff = subprocess.run(
         ["git", "-C", REPO_DIR, "diff", "-U0", "--diff-filter=ACM", base, "HEAD", "--", f],
         capture_output=True, text=True, check=True,
     ).stdout
-    lines = set()
+    intervals = []
     for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff, re.M):
         start = int(m.group(1))
         count = int(m.group(2)) if m.group(2) else 1
-        lines.update(range(start, start + count))
-    return lines
+        if count > 0:
+            intervals.append((start, start + count - 1))
+    return intervals
+
+
+def _in_intervals(line, intervals):
+    return any(s <= line <= e for s, e in intervals)
 
 
 def db_args(db, f):
@@ -180,11 +329,13 @@ def db_args(db, f):
 
 def main():
     if not BASE or not os.path.exists(DB):
-        print("### 🚦 gcc diff-gate: no compile DB or PR base — skipped")
+        print("#### 🚦 gcc diff-gate: no compile DB or PR base — skipped")
+        write_inline("skipped", [])
         return 0
     base = effective_base()
     db = json.load(open(DB))
     gated, advis, failed = [], [], []
+    analyzer, analyzer_failed = [], []
     for f in changed_files(base):
         info = db_args(db, f)
         if not info:
@@ -193,7 +344,7 @@ def main():
         want = changed_lines(base, f)
         if not want:
             continue
-        cmd = args + ["-c", "-o", os.devnull] + ALL_FLAGS + NO_ERROR
+        cmd = recompile_cmd(args, f)
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         for line in r.stderr.splitlines():
             if ": warning:" not in line and ": error:" not in line:
@@ -202,7 +353,7 @@ def main():
             t = TAG_RE.search(line)
             if not m or not t:
                 continue
-            if int(m.group(1)) not in want:
+            if not _in_intervals(int(m.group(1)), want):
                 continue
             tag = t.group(0)
             # Strip to the LAST repo dir in the path token: the runner checks out to
@@ -217,8 +368,9 @@ def main():
             elif tag in ADVISORY_TAGS:
                 advis.append(disp)
         if r.returncode != 0:
-            # Every candidate class is demoted with -Wno-error=, so a well-formed
-            # recompile of an already-built file exits 0. A nonzero code is a
+            # Every -Werror promotion is stripped from the DB args and each candidate
+            # class is also demoted with -Wno-error=, so a well-formed recompile of an
+            # already-built file exits 0. A nonzero code is a
             # MECHANISM failure, not a clean file: gcc aborts with "unrecognized
             # command-line option" for a clang-only/mistyped GATE/ADVISORY entry
             # (which would otherwise silently disable the gate for EVERY file), or
@@ -231,36 +383,80 @@ def main():
                            if ": error:" in ln), f"compiler exit {r.returncode}")
             reason = re.sub(r"^[^ ]*/(?:OneWifi|rdk-wifi-hal)/+", "", reason)  # same path-strip as disp
             failed.append(f"{f}: {reason}")
+        if ANALYZER:
+            # Second, time-boxed recompile: the -fanalyzer engine, changed-lines-scoped
+            # like the warning pass. Informational only -> collected separately, never
+            # gated/inlined. A timeout leaves this file's analyzer coverage partial (noted),
+            # never reds the job. The warning findings above are already recorded.
+            try:
+                ar = subprocess.run(analyzer_cmd(args, f), cwd=cwd,
+                                    capture_output=True, text=True,
+                                    timeout=ANALYZER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                analyzer_failed.append(f"{f}: -fanalyzer timed out after {ANALYZER_TIMEOUT}s")
+            else:
+                for line in ar.stderr.splitlines():
+                    if ": warning:" not in line:
+                        continue
+                    m = LINE_RE.search(line)
+                    t = ANALYZER_TAG_RE.search(line)
+                    if not m or not t or not _in_intervals(int(m.group(1)), want):
+                        continue
+                    analyzer.append(re.sub(r"^[^ ]*/(?:OneWifi|rdk-wifi-hal)/+", "", line))
     gated = sorted(set(gated))
     advis = sorted(set(advis))
     failed = sorted(set(failed))
+    analyzer = sorted(set(analyzer))
+    analyzer_failed = sorted(set(analyzer_failed))
+
+    # Inline-review candidates (Commit 5). Written on every non-skip path — including
+    # the clean case (empty list) so the poster removes any now-stale gcc comments.
+    inline, inline_dropped = build_inline(advis)
+    write_inline("ok", inline, inline_dropped)
 
     # GitHub annotations (top-of-check box).
     for l in gated[:10]:
         print(f"::error::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
     for l in advis[:10]:
         print(f"::warning::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
+    for l in analyzer[:10]:
+        print(f"::warning::{l}".replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
     for l in failed[:10]:
         print(f"::warning::gcc diff-gate could not recompile — {l}"
               .replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
+    for l in analyzer_failed[:10]:
+        print(f"::warning::gcc diff-gate could not run -fanalyzer — {l}"
+              .replace("%", "%25").replace("\r", "%0D"), file=sys.stderr)
 
-    if not gated and not advis and not failed:
-        print("### 🚦 gcc diff-gate: clean on changed lines")
+    if not gated and not advis and not failed and not analyzer and not analyzer_failed:
+        print("#### 🚦 gcc diff-gate: clean on changed lines")
         return 0
     if gated:
         verb = "on lines this PR changed" if ENFORCE else "would fail the job (advisory: ENFORCE=false)"
-        print(f"### ❌ gcc diff-gate — {len(gated)} {verb}")
+        print(f"#### ❌ gcc diff-gate — {len(gated)} {verb}")
         print("```")
         print("\n".join(gated[:100]))
         print("```")
         print("_Fix the finding, or suppress it with a GCC diagnostic pragma where intentional / refactor._")
     if advis:
-        print(f"### 🚦 gcc diff-gate advisory — {len(advis)} findings")
+        print(f"#### 🚦 gcc diff-gate advisory — {len(advis)} findings")
         print("```")
         print("\n".join(advis[:100]))
         print("```")
+    if analyzer:
+        print(f"#### 🔬 gcc -fanalyzer (informational) — {len(analyzer)}")
+        print("_Path-sensitive; advisory only, never gates or posts inline. Review in the Files tab._")
+        print("<details><summary>show findings</summary>")
+        print()
+        print("```")
+        print("\n".join(analyzer[:20]))
+        print("```")
+        print("</details>")
+    if analyzer_failed:
+        print(f"_-fanalyzer skipped {len(analyzer_failed)} file(s) (timeout >= {ANALYZER_TIMEOUT}s) — "
+              "informational coverage partial._")
     if failed:
-        print(f"### ⚠️ gcc diff-gate: {len(failed)} file(s) failed to recompile — coverage incomplete")
+        print(f"#### ⚠️ gcc diff-gate: {len(failed)} file(s) failed to recompile — coverage incomplete")
         print("```")
         print("\n".join(failed[:100]))
         print("```")
@@ -281,7 +477,9 @@ if __name__ == "__main__":
         # line so the comment isn't blank, warn, dump the trace to stderr for
         # debugging, and exit 0. Same approach as the clang-tidy gate.
         import traceback
-        print("### 🚦 gcc diff-gate: skipped (mechanism error) — failing open")
+        print("#### 🚦 gcc diff-gate: skipped (mechanism error) — failing open")
         print(f"::warning::gcc diff-gate mechanism error: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        # A mechanism error must not read as "all clean" to the poster either.
+        write_inline("skipped", [])
         sys.exit(0)
