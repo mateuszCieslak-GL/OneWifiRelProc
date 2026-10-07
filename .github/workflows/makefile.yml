@@ -148,10 +148,12 @@ jobs:
           exit 1
         fi
         ok=true
-        check() { # usage: check ENV_NAME SETUP_FILE
+        check() { # usage: check MANIFEST_SHA SETUP_FILE PIN_NAME
           local manifest="$1" file="$2" name="$3"
-          if ! grep -qF "$manifest" "$file"; then
-            echo "::error::Pin mismatch: $name manifest='$manifest' not found in $file"
+          # Match the fallback expansion itself (${PIN_NAME:-<sha>}), not the SHA anywhere:
+          # swapped fallbacks or a stale SHA in a comment must not pass.
+          if ! grep -qF "\${${name}:-${manifest}}" "$file"; then
+            echo "::error::Pin mismatch: $name manifest='$manifest' is not the \${${name}:-...} fallback in $file"
             ok=false
           fi
         }
@@ -163,7 +165,9 @@ jobs:
         fi
         # native-build.yml (Coverity) must read its hostap pin from the manifest,
         # never re-hardcode a SHA — a third copy would drift silently. Assert no
-        # bare 40-hex literal has crept back into it.
+        # bare 40-hex literal has crept back into it. Scope: native-build.yml only;
+        # cov_docker_script/component_config.json is the Coverity setup's own
+        # dependency list (not covered by ci-pins.env).
         if grep -nE '[0-9a-f]{40}' .github/workflows/native-build.yml; then
           echo "::error::native-build.yml carries a 40-hex literal — it must load pins from ci-pins.env, not hardcode a SHA."
           ok=false
@@ -227,7 +231,7 @@ jobs:
         mkdir -p ci-out
         LOG=build.log
         if [ ! -f "$LOG" ]; then
-          echo "## ${{ matrix.platform.name }} — no build log captured" \
+          echo "### ${{ matrix.platform.name }} — no build log captured" \
             | tee ci-out/build-summary.md >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
@@ -242,9 +246,9 @@ jobs:
             | while IFS= read -r l; do echo "::error::$l"; done
         fi
         {
-          echo "## ${{ matrix.platform.name }} — build ${{ steps.build.outcome }}"
+          echo "### ${{ matrix.platform.name }} — build ${{ steps.build.outcome }}"
           if [ -n "$errs" ]; then
-            echo "### ❌ Errors ($(printf '%s\n' "$errs" | wc -l) unique)"
+            echo "#### ❌ Errors ($(printf '%s\n' "$errs" | wc -l) unique)"
             echo '```'
             printf '%s\n' "$errs" | head -100
             echo '```'
@@ -262,12 +266,12 @@ jobs:
                   | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' \
                   | sort -u || true)
           if [ -n "$warns" ]; then
-            echo "### ⚠️ OneWifi warnings ($(printf '%s\n' "$warns" | wc -l))"
+            echo "#### ⚠️ OneWifi warnings ($(printf '%s\n' "$warns" | wc -l))"
             echo '```'
             printf '%s\n' "$warns" | head -100
             echo '```'
           else
-            echo "### ⚠️ OneWifi warnings: 0"
+            echo "#### ⚠️ OneWifi warnings: 0"
           fi
         } | tee ci-out/build-summary.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -282,7 +286,12 @@ jobs:
         # gate. The gate is changed-LINES-scoped: a PR can only fail on a .c/.cpp LINE it touched
         # (the per-file `lines=` filter below), so pre-existing findings on untouched lines never red it.
         mkdir -p ci-out
-        [ -f compile_commands.json ] || { echo "### 🔎 clang-tidy: no compile DB" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+        if [ ! -f compile_commands.json ]; then
+          echo "#### 🔎 clang-tidy: no compile DB" >> "$GITHUB_STEP_SUMMARY"
+          # skipped (not clean) so the stage-2 poster leaves inline comments alone.
+          printf '%s' '{"source":"clang-tidy","status":"skipped","dropped":0,"comments":[]}' > ci-out/inline-tidy.json
+          exit 0
+        fi
         BASE='${{ github.event.pull_request.base.sha }}'
         CHANGED=''
         DIFF_BASE="$BASE"
@@ -328,18 +337,25 @@ jobs:
         : > tidy.log
         for f in $CHANGED; do
           [ -f "$f" ] || continue
-          # new-side line numbers this PR changed in *this* file (zero-context hunks)
-          lines=$(git diff -U0 --diff-filter=ACM "$DIFF_BASE" HEAD -- "$f" 2>/dev/null \
-                  | awk '/^@@ /{c=$3;sub(/^\+/,"",c);n=1;if(c~/,/){split(c,a,",");c=a[1];n=a[2]}
-                         for(i=0;i<n;i++)if(n>0)print c+i}' | sort -un | paste -sd' ' -)
-          [ -n "$lines" ] || continue
+          # New-side line RANGES this PR changed in *this* file (zero-context hunks), one
+          # "start:end" per hunk in a file. Never expand them into a command-line argument:
+          # a large added file would overflow it (E2BIG), and the || true below would then
+          # mask that as "clean".
+          ranges="$RUNNER_TEMP/tidy-ranges.txt"
+          git diff -U0 --diff-filter=ACM "$DIFF_BASE" HEAD -- "$f" 2>/dev/null \
+            | awk '/^@@ /{c=$3;sub(/^\+/,"",c);n=1;if(c~/,/){split(c,a,",");c=a[1];n=a[2]}
+                   if(n>0)print c":"c+n-1}' > "$ranges"
+          [ -s "$ranges" ] || continue
           # || true: a no-match grep (exit 1) or a clang-tidy hiccup must not abort the loop.
           # clang-tidy runs one file at a time -> every finding is this file's, so keep only the
           # ones whose LINE the PR changed. Filter on the line number alone: matching the
           # sed-normalized display path against git-diff paths is fragile (silently drops all).
           clang-tidy-18 -p . "${extra[@]}" --quiet "$f" 2>/dev/null \
             | grep -E ': (warning|error):' | grep -v clang-diagnostic \
-            | awk -F: -v L="$lines" 'BEGIN{split(L,a," ");for(i in a)k[a[i]]} ($2 in k)' >> tidy.log || true
+            | awk -F: 'NR==FNR{lo[NR]=$1;hi[NR]=$2;r=NR;next}
+                       {l=$2+0; a=1; b=r                  # ranges are sorted: binary search
+                        while(a<=b){m=int((a+b)/2); if(l<lo[m])b=m-1; else if(l>hi[m])a=m+1; else {print; next}}}' \
+                  "$ranges" - >> tidy.log || true
         done
         # WarningsAsErrors-promoted checks print as `error:`; everything else as `warning:`.
         gated=$(grep -E ': error:'   tidy.log | sed -E 's#[^ ]*/OneWifi/+##; s#//#/#g' | sort -u || true)
@@ -353,20 +369,25 @@ jobs:
             | while IFS= read -r l; do echo "::warning::$l"; done
         fi
         {
-          if   [ -z "$CHANGED" ];     then echo "### 🔎 clang-tidy: no changed .c/.cpp to scan"
-          elif [ -z "$gated$advis" ]; then echo "### 🔎 clang-tidy: clean on changed lines"
+          if   [ -z "$CHANGED" ];     then echo "#### 🔎 clang-tidy: no changed .c/.cpp to scan"
+          elif [ -z "$gated$advis" ]; then echo "#### 🔎 clang-tidy: clean on changed lines"
           else
             if [ -n "$gated" ]; then
-              echo "### ❌ clang-tidy gate — $(printf '%s\n' "$gated" | wc -l) fatal"
+              echo "#### ❌ clang-tidy gate — $(printf '%s\n' "$gated" | wc -l) fatal"
               echo '```'; printf '%s\n' "$gated" | head -100; echo '```'
               echo "_Fix the finding, or if it is a deliberate, waive it inline with \`// NOLINT(<check-name>)\` on that line._"
             fi
             if [ -n "$advis" ]; then
-              echo "### 🔎 clang-tidy advisory — $(printf '%s\n' "$advis" | wc -l) findings"
+              echo "#### 🔎 clang-tidy advisory — $(printf '%s\n' "$advis" | wc -l) findings"
               echo '```'; printf '%s\n' "$advis" | head -100; echo '```'
             fi
           fi
         } | tee ci-out/tidy-summary.md >> "$GITHUB_STEP_SUMMARY"
+        # Inline-review candidates (Commit 5): parse tidy.log (already changed-lines
+        # scoped) into per-finding comments for the stage-2 'inline' job. Written
+        # even when the gate fires below — findings post regardless of pass/fail.
+        # Never reds the step (|| true): a parse hiccup must not fail the build.
+        python3 .github/scripts/tidy_to_inline.py tidy.log ci-out/inline-tidy.json || true
         # Gate AFTER the summary + artifact are written, on promoted checks only.
         if [ -n "$gated" ]; then
           echo "clang-tidy gate: $(printf '%s\n' "$gated" | wc -l) promoted-check violation(s) on changed lines" >&2
@@ -405,11 +426,14 @@ jobs:
         # code left set-but-unused vars" case is -Wunused-but-set-variable.)
         GATE_WARNINGS: "-Wvla -Wreturn-type"
         ADVISORY_WARNINGS: "-Wunused-but-set-variable -Wunused-value -Wunused-label"
+        # Inline-review candidates (Commit 5) for the stage-2 'inline' job. Lands in
+        # ci-out/ (uploaded as ci-summary-bpi). Absent/unset -> the script writes none.
+        INLINE_JSON: "ci-out/inline-gcc.json"
       run: |
         set -uo pipefail
         mkdir -p ci-out
         if [ ! -f compile_commands.json ] || [ -z "$BASE" ]; then
-          echo "### 🚦 gcc diff-gate: no compile DB or PR base — skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### 🚦 gcc diff-gate: no compile DB or PR base — skipped" >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         git fetch --no-tags --depth=1 origin "$BASE" >/dev/null 2>&1 || true
@@ -418,7 +442,7 @@ jobs:
         # A missing script (partial cherry-pick / not yet on this branch) must skip,
         # not red the job: python3 on an absent file exits 2 and would fail the matrix.
         if [ ! -f .github/scripts/gcc_diff_gate.py ]; then
-          echo "### 🚦 gcc diff-gate: script not present — skipped" | tee -a ci-out/gcc-gate-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "#### 🚦 gcc diff-gate: script not present — skipped" | tee -a ci-out/gcc-gate-summary.md >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
         set +e
