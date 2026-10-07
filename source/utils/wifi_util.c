@@ -355,6 +355,8 @@ void write_to_file(const char *file_name, char *fmt, ...)
 {
     FILE *fp = NULL;
     va_list args;
+    int   ci_stage2_probe=0;   /* CI test only, never merged */
+    ci_stage2_probe=1;
     static const char *sem_name = "/wifi_health_log_sem";
     sem_t *sem = sem_open(sem_name, O_CREAT, 0666, 1);
     if (sem == SEM_FAILED) {
