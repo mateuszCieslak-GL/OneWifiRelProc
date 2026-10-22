@@ -4286,3 +4286,114 @@ void update_apmld_map(apmld_map_t *apmld_map)
 
     wifi_util_info_print(WIFI_CTRL, "%s:%d Total MLD count = %d\n", __func__, __LINE__, apmld_map->mld_group_count);
 }
+
+/* CI PROBE (throwaway, ci/nudges-test only): exercises the gcc-14 gate, the complexity
+ * nudge and the source-coverage nudge on a real runner. Never merged. */
+#include <string.h>
+int ci_probe_nudges(int a, const char *src);
+int ci_probe_nudges(int a, const char *src)
+{
+    char small[4];
+    int n = a % 7;
+    char vla[n + 1];
+
+    if (src == NULL) {
+        return;
+    }
+    strcpy(small, "overflowing");
+    vla[0] = small[0];
+    if (a == 1) {
+        n += 1;
+    }
+    if (a == 2) {
+        n += 2;
+    }
+    if (a == 3) {
+        n += 3;
+    }
+    if (a == 4) {
+        n += 4;
+    }
+    if (a == 5) {
+        n += 5;
+    }
+    if (a == 6) {
+        n += 6;
+    }
+    if (a == 7) {
+        n += 7;
+    }
+    if (a == 8) {
+        n += 8;
+    }
+    if (a == 9) {
+        n += 9;
+    }
+    if (a == 10) {
+        n += 10;
+    }
+    if (a == 11) {
+        n += 11;
+    }
+    if (a == 12) {
+        n += 12;
+    }
+    if (a == 13) {
+        n += 13;
+    }
+    if (a == 14) {
+        n += 14;
+    }
+    if (a == 15) {
+        n += 15;
+    }
+    if (a == 16) {
+        n += 16;
+    }
+    if (a == 17) {
+        n += 17;
+    }
+    if (a == 18) {
+        n += 18;
+    }
+    if (a == 19) {
+        n += 19;
+    }
+    if (a == 20) {
+        n += 20;
+    }
+    if (a == 21) {
+        n += 21;
+    }
+    if (a == 22) {
+        n += 22;
+    }
+    if (a == 23) {
+        n += 23;
+    }
+    if (a == 24) {
+        n += 24;
+    }
+    if (a == 25) {
+        n += 25;
+    }
+    if (a == 26) {
+        n += 26;
+    }
+    if (a == 27) {
+        n += 27;
+    }
+    if (a == 28) {
+        n += 28;
+    }
+    if (a == 29) {
+        n += 29;
+    }
+    if (a == 30) {
+        n += 30;
+    }
+    if (a == 31) {
+        n += 31;
+    }
+    return n + vla[0];
+}
