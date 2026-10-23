@@ -4286,3 +4286,24 @@ void update_apmld_map(apmld_map_t *apmld_map)
 
     wifi_util_info_print(WIFI_CTRL, "%s:%d Total MLD count = %d\n", __func__, __LINE__, apmld_map->mld_group_count);
 }
+
+/* CI PROBE (throwaway, ci/d2a-test only): 12 compile errors for the build failure attribution
+ * and the 10-line error box. Never merged. */
+int ci_probe_attribution(void);
+int ci_probe_attribution(void)
+{
+    int total = 0;
+    total += ci_probe_missing_01;
+    total += ci_probe_missing_02;
+    total += ci_probe_missing_03;
+    total += ci_probe_missing_04;
+    total += ci_probe_missing_05;
+    total += ci_probe_missing_06;
+    total += ci_probe_missing_07;
+    total += ci_probe_missing_08;
+    total += ci_probe_missing_09;
+    total += ci_probe_missing_10;
+    total += ci_probe_missing_11;
+    total += ci_probe_missing_12;
+    return total;
+}
