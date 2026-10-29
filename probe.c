@@ -1,8 +1,9 @@
 int probe(int x)
 {
     if (x) {
+        unlock();
         foo(a,
-            b, old_c);
+            b, new_c);
     }
     return 0;
 }
