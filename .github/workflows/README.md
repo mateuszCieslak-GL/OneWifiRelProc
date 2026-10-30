@@ -71,13 +71,14 @@ lines (git-clang-format can reformat adjacent lines it didn't need to) and any t
 a statement while every line fits in 120 columns (clang-format refills a touched statement up to
 the limit; `CODE_STYLE.md` leaves line breaks within the limit to the author). Brace placement and
 one statement per line still post, and so do suggestions that un-align assignments
-(`CODE_STYLE.md`: do not align them). A suggestion that only un-aligns declared names (a struct
-whose member names, and comments after them, line up in columns) is not posted: that alignment is
-the author's call. A suggestion whose range has a line the PR deleted inside it is dropped too:
+(`CODE_STYLE.md`: do not align them). A suggestion that only closes up a column the author lined
+up (struct member names, `#define` values, enum values, trailing comments) is not posted: that
+alignment is the author's call. A suggestion whose range has a line the PR deleted inside it is dropped too:
 GitHub refuses to apply those ("Applying suggestions on deleted lines is currently not
 supported"); stage 1 records where the PR deleted lines in `deleted-lines.txt`. Each suggestion
 box comes with one line of text above it (what to do, a link to `CODE_STYLE.md`, and that applying
-it commits it). It currently only posts suggestions — the `exit 1` that would fail the job is
+it commits it, several at once with "Add suggestion to batch"). `CODE_STYLE.md` "Auto format" shows
+how to run the same clang-format version locally on just the changed lines. It currently only posts suggestions — the `exit 1` that would fail the job is
 present but commented out, so this does **not** block merge today.
 
 **b) Tree-wide clean-baseline enforcement** — mixed gate/report, whole tree. The build runs with a

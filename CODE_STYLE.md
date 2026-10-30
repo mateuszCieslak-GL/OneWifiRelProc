@@ -155,6 +155,7 @@ int32_t a = sum( 4, 3 );            /* Wrong */
 int32_t a = sum(4,3);               /* Wrong */
 ```
 - Do not add trailing spaces.
+- Lining up structure member names, enumeration values, `#define` values or trailing comments in a column is up to the author. Do not align assignments (see [Variables](#variables)).
 
 ## Brackets
 
@@ -859,7 +860,6 @@ void my_func(void)
 
 - Structure or enumeration name must be lowercase with optional underscore `_` character between words.
 - Structure fields must be lowercase with underscores without m_ prefix.
-- Aligning member names (and comments after them) in a column is up to the author. Do not align assignments (see [Variables](#variables)).
 - Opening curly bracket for initializations is always at the same line.
 ```c
 /* OK */
@@ -1286,7 +1286,15 @@ printf("%s:%d failed to get interface flags, error: %d (%s)\n", __func__,
 
 ## Auto format
 
-Use auto-format of the code by clang-format tool. The formatting rules are specified in `.clang-format` configuration file in the root of the project. Most of the editors support clang-format as plugin. For example, VScode comes with pre-installed clang-format tool and automatically detects `.clang-format` file.
+The formatting rules are in the `.clang-format` file in the root of the project. Format only the lines you changed, with the clang-format version CI uses:
+
+```sh
+pip install clang-format==18.1.8
+git clang-format --diff upstream/develop    # show what it would change in the lines you changed
+git clang-format upstream/develop           # change them
+```
+
+Use the branch your PR targets, under the name your clone gives the rdkcentral repository (`upstream/develop` above). Editor plugins read `.clang-format` too (VS Code detects it), but do not let them format whole files on save: that rewrites lines you did not change. clang-format also re-wraps lines and closes up column alignment, which this guide leaves to you (see [Line length](#line-length) and [Spaces](#spaces)); CI does not suggest those changes, so you can keep your own.
 
 
 ## Third party code

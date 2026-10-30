@@ -158,30 +158,34 @@ def _wrap_break(chars, depths, idx):
     return depths[idx] > 0 or chars[idx] in WRAP_AFTER or member
 
 
-# A declaration with no initializer: type, the gap before the name, the name (with its `*`s,
-# array size or bit width), then `;` and an optional comment. No `(`: prototypes are not aligned.
-MEMBER = re.compile(r"^(?P<type>\s*[A-Za-z_][\w ]*?[\w*])(?P<gap>\s+)"
-                    r"(?P<rest>\**[A-Za-z_]\w*(?:\s*\[[^\]]*\])*(?:\s*:\s*\w+)?\s*;\s*(?://.*|/\*.*)?)$")
-COMMENT_GAP = re.compile(r";[ \t]*(?=//|/\*)")
+# Gaps an author may widen to line things up in a column. MEMBER: a declaration with no
+# initializer, the gap before the name (with its `*`s, array size or bit width). No `(`:
+# prototypes are not aligned. DEFINE: the gap before a #define's value. ENUM_VALUE: the gap
+# before an enumerator's `=` (no `;`, so not an assignment). COMMENT_GAP: before a trailing comment.
+MEMBER = re.compile(r"^(?P<head>\s*[A-Za-z_][\w ]*?[\w*])\s+"
+                    r"(?P<rest>\**[A-Za-z_]\w*(?:\s*\[[^\]]*\])*(?:\s*:\s*\w+)?\s*;.*)$")
+DEFINE = re.compile(r"^(?P<head>\s*#\s*define\s+[A-Za-z_]\w*(?:\([^)]*\))?)\s+(?P<rest>\S.*)$")
+ENUM_VALUE = re.compile(r"^(?P<head>\s*[A-Za-z_]\w*)\s+(?P<rest>=[^=;]*)$")
+COMMENT_GAP = re.compile(r"(?<=\S)[ \t]+(?=//|/\*)")
 
 
-def aligned_members_only(removed, added):
-    """True when a suggestion only changes the gap between type and name in declarations with
-    no initializer, and the gap before a comment after them, as in a struct whose member names
-    and comments are aligned in columns: that alignment is the author's call. Aligned
-    assignments still post (CODE_STYLE.md: do not align them)."""
+def _unaligned(line):
+    """The line with its column-alignment gaps (see above) closed up to one space."""
+    text = COMMENT_GAP.sub(" ", line)
+    for pattern in (DEFINE, ENUM_VALUE, MEMBER):
+        hit = pattern.match(text)
+        if hit and not (pattern is MEMBER and ("=" in text or "(" in text)):
+            return hit["head"] + " " + hit["rest"]
+    return text
+
+
+def aligned_only(removed, added):
+    """True when a suggestion only closes up gaps that line things up in a column: struct member
+    names, #define values, enum values and trailing comments. That layout is the author's call.
+    Aligned assignments still post (CODE_STYLE.md: do not align them)."""
     if len(removed) != len(added) or removed == added:
         return False
-    for old, new in zip(removed, added):
-        if old == new:
-            continue
-        old_hit, new_hit = MEMBER.match(old), MEMBER.match(new)
-        if not old_hit or not new_hit or "=" in old or "(" in old:
-            return False
-        old_rest, new_rest = (COMMENT_GAP.sub("; ", hit["rest"]) for hit in (old_hit, new_hit))
-        if (old_hit["type"], old_rest) != (new_hit["type"], new_rest):
-            return False
-    return True
+    return all(old == new or _unaligned(old) == _unaligned(new) for old, new in zip(removed, added))
 
 
 def reflow_only(removed, added):
@@ -325,7 +329,7 @@ def parse(diff_text):
         }
         if reflow_only(removed, added):
             c["reflow"] = True
-        elif aligned_members_only(removed, added):
+        elif aligned_only(removed, added):
             c["aligned"] = True
         if len(removed) > 1:
             c["start_line"] = start
@@ -369,7 +373,8 @@ def intro():
     repo = os.environ.get("GITHUB_REPOSITORY")
     style = f"[CODE_STYLE.md]({server}/{repo}/blob/HEAD/CODE_STYLE.md)" if repo else "CODE_STYLE.md"
     return (f"**Code style:** you are asked to fix formatting of lines you changed (see {style}). "
-            "As with Copilot review, clicking 'Apply suggestion' will commit it.")
+            "As with Copilot review, clicking 'Apply suggestion' will commit it; "
+            "'Add suggestion to batch' commits several at once.")
 
 
 def main():
@@ -432,7 +437,7 @@ def main():
     aligned = sum(1 for comment in comments if comment.get("aligned"))
     comments = [comment for comment in comments if not comment.pop("aligned", False)]
     if aligned:
-        print(f"Alignment: dropped {aligned} suggestion(s) that only un-align declared names")
+        print(f"Alignment: dropped {aligned} suggestion(s) that only undo column alignment")
 
     for comment in comments:
         comment["body"] = intro() + "\n\n" + comment["body"]

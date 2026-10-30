@@ -82,7 +82,7 @@ class Reflow(unittest.TestCase):
 
 
 class Alignment(unittest.TestCase):
-    def test_aligned_members_only(self):
+    def test_aligned_only(self):
         cases = [   # (current lines, suggested lines, dropped)
             (["    bool        valid;"], ["    bool valid;"], True),                          # aligned member name
             (["    const char  *path;"], ["    const char *path;"], True),                    # pointer
@@ -90,14 +90,21 @@ class Alignment(unittest.TestCase):
              ["    uint8_t mac[6];", "    int flag : 1;"], True),                              # array, bit field
             (["    size_t      off;   /* c */"], ["    size_t off; /* c */"], True),           # aligned comment too
             (["    int a;", "    long        b;"], ["    int a;", "    long b;"], True),       # one line changes
+            (["#define WIFI_EM_QUERY      \"Device.WiFi.EM\""], ['#define WIFI_EM_QUERY "Device.WiFi.EM"'], True),
+            (["#define MAX(a, b)   ((a) > (b) ? (a) : (b))"], ["#define MAX(a, b) ((a) > (b) ? (a) : (b))"], True),
+            (["    DHCP_OFFER    = 2,", "    DHCP_REQUEST  = 3,"],
+             ["    DHCP_OFFER = 2,", "    DHCP_REQUEST = 3,"], True),                          # enum values
+            (["        return 0;  // safe fallback"], ["        return 0; // safe fallback"], True),   # trailing comment
             (["    int a   = 1;"], ["    int a = 1;"], False),                               # assignment: CODE_STYLE.md
+            (["    x   = 1;"], ["    x = 1;"], False),                                       # assignment, no type
             (["int    foo(void);"], ["int foo(void);"], False),                                # prototype
+            (["#define SUM  (a+b)"], ["#define SUM (a + b)"], False),                          # + spacing in the value
             (["    bool    valid; "], ["    bool valid;"], False),                            # + trailing space fix
             (["  bool    valid;"], ["    bool valid;"], False),                                # + indentation fix
-            (["    x =  1;"], ["    x = 1;"], False),                                          # not a declaration
+            (["    x =  1;"], ["    x = 1;"], False),                                          # a stray double space
         ]
         for removed, added, dropped in cases:
-            self.assertEqual(d2s.aligned_members_only(removed, added), dropped, removed)
+            self.assertEqual(d2s.aligned_only(removed, added), dropped, removed)
 
 
 class Scoping(unittest.TestCase):
