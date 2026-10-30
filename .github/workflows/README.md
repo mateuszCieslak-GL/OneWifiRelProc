@@ -70,12 +70,15 @@ it into GitHub review `suggestion` blocks, dropping any suggestion outside the P
 lines (git-clang-format can reformat adjacent lines it didn't need to) and any that only re-wraps
 a statement while every line fits in 120 columns (clang-format refills a touched statement up to
 the limit; `CODE_STYLE.md` leaves line breaks within the limit to the author). Brace placement and
-one statement per line still post. A suggestion whose range has a line the PR deleted inside
-it is dropped too: GitHub refuses to apply those ("Applying suggestions on deleted lines is
-currently not supported"); stage 1 records where the PR deleted lines in `deleted-lines.txt`.
-Each suggestion box comes with one line of text above it (what to do, a link to
-`CODE_STYLE.md`, and that applying it commits it). It currently only posts suggestions — the `exit 1` that would fail the job is present
-but commented out, so this does **not** block merge today.
+one statement per line still post, and so do suggestions that un-align assignments
+(`CODE_STYLE.md`: do not align them). A suggestion that only un-aligns declared names (a struct
+whose member names, and comments after them, line up in columns) is not posted: that alignment is
+the author's call. A suggestion whose range has a line the PR deleted inside it is dropped too:
+GitHub refuses to apply those ("Applying suggestions on deleted lines is currently not
+supported"); stage 1 records where the PR deleted lines in `deleted-lines.txt`. Each suggestion
+box comes with one line of text above it (what to do, a link to `CODE_STYLE.md`, and that applying
+it commits it). It currently only posts suggestions — the `exit 1` that would fail the job is
+present but commented out, so this does **not** block merge today.
 
 **b) Tree-wide clean-baseline enforcement** — mixed gate/report, whole tree. The build runs with a
 Yocto-derived baseline (`-Wall -Wextra` plus explicit `-Wno-*` suppressions for known backlog
@@ -262,6 +265,13 @@ means "rebuild it," never a silently stale hit (the one network-outage exception
 cache is saved at job end, after the device build has compiled hostap objects in-tree, so on every
 hit the action deletes those `*.o` files: the key covers source and patch inputs, not CFLAGS or the
 toolchain, and the cache exists to skip the clone and patch, not the compile.
+
+**Why Build Check also runs on pushes to `develop`.** Those runs build merged, trusted code and
+save the hostap cache in `develop`'s scope, which every PR can restore. A PR run can only save into
+its own PR's scope, so code from a fork never writes a cache another PR reads; without the
+`develop` runs, every cache-key change would send each PR back to cloning git.w1.fi. They also
+feed the "develop's latest Build Check" line that a red PR build gets in its summary (§3h). Keep
+the `push` trigger.
 
 The action's steps use `shell: sh` and stay POSIX: `native-build.yml` runs inside the
 `docker-rdk-ci` container, whose shell is dash (no bash, so no `set -o pipefail`). The same holds

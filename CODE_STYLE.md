@@ -859,6 +859,7 @@ void my_func(void)
 
 - Structure or enumeration name must be lowercase with optional underscore `_` character between words.
 - Structure fields must be lowercase with underscores without m_ prefix.
+- Aligning member names (and comments after them) in a column is up to the author. Do not align assignments (see [Variables](#variables)).
 - Opening curly bracket for initializations is always at the same line.
 ```c
 /* OK */

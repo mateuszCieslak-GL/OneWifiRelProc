@@ -81,6 +81,25 @@ class Reflow(unittest.TestCase):
                 self.assertEqual(d2s.reflow_only(removed, added), dropped)
 
 
+class Alignment(unittest.TestCase):
+    def test_aligned_members_only(self):
+        cases = [   # (current lines, suggested lines, dropped)
+            (["    bool        valid;"], ["    bool valid;"], True),                          # aligned member name
+            (["    const char  *path;"], ["    const char *path;"], True),                    # pointer
+            (["    uint8_t     mac[6];", "    int         flag : 1;"],
+             ["    uint8_t mac[6];", "    int flag : 1;"], True),                              # array, bit field
+            (["    size_t      off;   /* c */"], ["    size_t off; /* c */"], True),           # aligned comment too
+            (["    int a;", "    long        b;"], ["    int a;", "    long b;"], True),       # one line changes
+            (["    int a   = 1;"], ["    int a = 1;"], False),                               # assignment: CODE_STYLE.md
+            (["int    foo(void);"], ["int foo(void);"], False),                                # prototype
+            (["    bool    valid; "], ["    bool valid;"], False),                            # + trailing space fix
+            (["  bool    valid;"], ["    bool valid;"], False),                                # + indentation fix
+            (["    x =  1;"], ["    x = 1;"], False),                                          # not a declaration
+        ]
+        for removed, added, dropped in cases:
+            self.assertEqual(d2s.aligned_members_only(removed, added), dropped, removed)
+
+
 class Scoping(unittest.TestCase):
     def test_commentable_intervals_grow_and_merge(self):
         self.assertEqual(d2s._commentable_intervals([(5, 6)], 3), [[2, 9]])
